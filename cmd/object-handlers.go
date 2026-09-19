@@ -62,6 +62,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/s3select"
 	"github.com/minio/mux"
+	"github.com/minio/sio"
 	"github.com/pgsty/silo-pkg/v3/policy"
 )
 
@@ -687,6 +688,20 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 	objInfo.decryptPartsChecksums(r.Header)
 
 	if _, ok := opts.ObjectAttributes[xhttp.ObjectParts]; ok {
+		// Report each part's uploaded plaintext byte length. Parts are stored
+		// transformed, compressed and/or encrypted, so the stored size is not
+		// what AWS defines ObjectPart.Size to be.
+		_, isEncrypted := crypto.IsEncrypted(objInfo.UserDefined)
+		isCompressed := objInfo.IsCompressed()
+		// Only a part of an encrypted multipart object is a stream of its
+		// own. A legacy encrypted object without that marker is one
+		// continuous stream that the erasure writer split into storage
+		// fragments, so no fragment has a plaintext length to report and
+		// each keeps its stored size, as ObjectInfo.DecryptedSize and
+		// DecryptBlocksRequestR also treat it.
+		hasEncryptedParts := isEncrypted &&
+			(crypto.IsMultiPart(objInfo.UserDefined) || len(objInfo.Parts) == 1)
+
 		OA.ObjectParts = new(objectAttributesParts)
 		OA.ObjectParts.PartNumberMarker = opts.PartNumberMarker
 
@@ -701,7 +716,36 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 				}
 
 				if len(OA.ObjectParts.Parts) == opts.MaxParts {
+					// This page is full and at least one more part
+					// is still pending, so the listing is truncated.
+					OA.ObjectParts.IsTruncated = true
 					break
+				}
+
+				partSize := objInfo.Parts[i].Size
+				switch {
+				case isCompressed:
+					// ActualSize is recorded by the same code that compresses,
+					// so it is always present for a compressed part.
+					if objInfo.Parts[i].ActualSize >= 0 {
+						partSize = objInfo.Parts[i].ActualSize
+					}
+				case hasEncryptedParts:
+					// ActualSize cannot be trusted for encrypted parts: a
+					// replicated SSE-C part records the ciphertext length, and
+					// parts written before actualSize existed record 0. Derive
+					// the plaintext length from the ciphertext instead, exactly
+					// as ObjectInfo.DecryptedSize does. A part whose stored
+					// length is not a valid encrypted stream has no logical
+					// length to report, and DecryptObjectInfo above only
+					// validates the object as a whole in that case, because
+					// ObjectInfo.isMultipart gives up on the first bad part.
+					decrypted, err := sio.DecryptedSize(uint64(partSize))
+					if err != nil {
+						writeErrorResponse(ctx, w, toAPIError(ctx, errObjectTampered), r.URL)
+						return
+					}
+					partSize = int64(decrypted)
 				}
 
 				OA.ObjectParts.NextPartNumberMarker = v.Number
@@ -712,13 +756,16 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 					ChecksumCRC32C:    objInfo.Parts[i].Checksums["CRC32C"],
 					ChecksumCRC64NVME: objInfo.Parts[i].Checksums["CRC64NVME"],
 					PartNumber:        objInfo.Parts[i].Number,
-					Size:              objInfo.Parts[i].Size,
+					Size:              partSize,
 				})
 			}
 		}
 
-		if OA.ObjectParts.NextPartNumberMarker != partsLength {
-			OA.ObjectParts.IsTruncated = true
+		// Part numbers may be sparse, so they cannot be compared against
+		// the part count. NextPartNumberMarker only carries a continuation
+		// token for a truncated listing, as in ListObjectParts.
+		if !OA.ObjectParts.IsTruncated {
+			OA.ObjectParts.NextPartNumberMarker = 0
 		}
 	}
 
@@ -1156,18 +1203,63 @@ const federatedInternalAppName = "minio-federated"
 // Applicable only in a federated deployment
 var getRemoteInstanceClient = func(r *http.Request, host string) (*miniogo.Core, error) {
 	cred := getReqAccessCred(r, globalSite.Region())
+	transport := getRemoteInstanceTransport()
+	if transport == nil {
+		var err error
+		transport, err = miniogo.DefaultTransport(globalIsTLS)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// In a federated deployment, all the instances share config files
 	// and hence expected to have same credentials.
 	core, err := miniogo.NewCore(host, &miniogo.Options{
 		Creds:     credentials.NewStaticV4(cred.AccessKey, cred.SecretKey, ""),
 		Secure:    globalIsTLS,
-		Transport: getRemoteInstanceTransport(),
+		Transport: federatedWriteTransport{transport},
 	})
 	if err != nil {
 		return nil, err
 	}
 	core.SetAppInfo(federatedInternalAppName, ReleaseTag)
 	return core, nil
+}
+
+// federatedChecksumType maps a requested server-side checksum type to the
+// minio-go checksum the federation proxy asks the remote deployment to compute
+// on the forwarded PutObject. Returns ChecksumNone for an unset/unknown type.
+func federatedChecksumType(t hash.ChecksumType) miniogo.ChecksumType {
+	switch t.Base() {
+	case hash.ChecksumCRC32:
+		return miniogo.ChecksumCRC32
+	case hash.ChecksumCRC32C:
+		return miniogo.ChecksumCRC32C
+	case hash.ChecksumSHA1:
+		return miniogo.ChecksumSHA1
+	case hash.ChecksumSHA256:
+		return miniogo.ChecksumSHA256
+	case hash.ChecksumCRC64NVME:
+		return miniogo.ChecksumCRC64NVME
+	}
+	return miniogo.ChecksumNone
+}
+
+// federatedChecksumValue returns the base64 checksum the remote deployment
+// reported for the requested type on the forwarded PutObject.
+func federatedChecksumValue(t hash.ChecksumType, info miniogo.UploadInfo) string {
+	switch t.Base() {
+	case hash.ChecksumCRC32:
+		return info.ChecksumCRC32
+	case hash.ChecksumCRC32C:
+		return info.ChecksumCRC32C
+	case hash.ChecksumSHA1:
+		return info.ChecksumSHA1
+	case hash.ChecksumSHA256:
+		return info.ChecksumSHA256
+	case hash.ChecksumCRC64NVME:
+		return info.ChecksumCRC64NVME
+	}
+	return ""
 }
 
 // Check if the destination bucket is on a remote site, this code only gets executed
@@ -1318,11 +1410,27 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	}
 	allowReplicationMetadata := replicaTrusted
 
-	// Check if bucket encryption is enabled
-	sseConfig, _ := globalBucketSSEConfigSys.Get(dstBucket)
-	sseConfig.Apply(r.Header, sse.ApplyOptions{
-		AutoEncrypt: globalAutoEncryption,
-	})
+	// Federation only: the destination bucket lives on another deployment and
+	// the copy is forwarded to it as a PutObject. That remote write owns the
+	// destination's storage transformations, so this handler hands it the
+	// logical (decompressed, decrypted) bytes at their logical size and lets
+	// the remote compress and encrypt once. Encrypting here as well would
+	// forward ciphertext under the destination's own SSE option, which either
+	// fails the length check or, for SSE to SSE, has the remote encrypt the
+	// ciphertext a second time and store an unreadable object (#158).
+	remoteCallRequired := isRemoteCopyRequired(ctx, srcBucket, dstBucket, objectAPI)
+
+	// Apply the destination bucket's default encryption only when this
+	// deployment writes the destination. For a remote destination the proxy
+	// has no authority over that bucket's defaults: applying its own here
+	// would forward an explicit SSE header that the remote then honors in
+	// place of the destination's configuration (#167).
+	if !remoteCallRequired {
+		sseConfig, _ := globalBucketSSEConfigSys.Get(dstBucket)
+		sseConfig.Apply(r.Header, sse.ApplyOptions{
+			AutoEncrypt: globalAutoEncryption,
+		})
+	}
 	var srcOpts, dstOpts ObjectOptions
 	srcOpts, err = copySrcOpts(ctx, r, srcBucket, srcObject)
 	if err != nil {
@@ -1387,6 +1495,12 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	}
 	defer gr.Close()
 	srcInfo := gr.ObjInfo
+	// A trusted SSE-C replica reads raw ciphertext. Federation's ordinary PUT
+	// expects plaintext and does not forward the replica's sealed-key metadata.
+	if remoteCallRequired && replicaTrusted && crypto.SSEC.IsEncrypted(srcInfo.UserDefined) {
+		writeErrorResponse(ctx, w, toAPIError(ctx, NotImplemented{Message: "federated raw SSE-C replica CopyObject is not supported"}), r.URL)
+		return
+	}
 
 	// maximum Upload size for object in a single CopyObject operation.
 	if isMaxObjectSize(srcInfo.Size) {
@@ -1437,7 +1551,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	// Pass the decompressed stream to such calls.
 	isDstCompressed := isCompressible(r.Header, dstObject) &&
 		length > minCompressibleSize &&
-		!isRemoteCopyRequired(ctx, srcBucket, dstBucket, objectAPI)
+		!remoteCallRequired
 	if isDstCompressed {
 		compressMetadata = make(map[string]string, 2)
 		// Preserving the compression metadata.
@@ -1512,8 +1626,19 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	// data instead, the rotation has to go through the regular re-encrypting
 	// copy, or the destination ends up holding plaintext under metadata that
 	// claims the object is encrypted.
+	//
+	// A checksum algorithm the client asks for has to be computed over the object
+	// data, which an in-place rotation never reads, so leave the fast path and
+	// let the re-encrypting copy compute, store and report it. A replica-trusted
+	// request is not such a client: getOpts.ReplicationRequest leaves its source
+	// reader encrypted, so a rewrite would hash ciphertext, and a replica has to
+	// keep the checksum its source assigned.
+	// Without a requested destination checksum algorithm, an in-place SSE-C
+	// rotation preserves the stored checksum state, including absence; it does
+	// not add the default CRC64NVME.
 	canRotateKeyInPlace := !srcInfo.Legacy &&
-		!copyRewritesObjectData(srcInfo.metadataOnly, copySrcOpts, dstOpts)
+		!copyRewritesObjectData(srcInfo.metadataOnly, copySrcOpts, dstOpts) &&
+		(replicaTrusted || !hash.NewChecksumHeader(r.Header).IsSet())
 
 	// If src == dst and either
 	// - the object is encrypted using SSE-C and two different SSE-C keys are present
@@ -1555,6 +1680,9 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		var targetSize int64
 
 		switch {
+		case remoteCallRequired:
+			// The remote receives the logical bytes, see above.
+			targetSize = actualSize
 		case isDstCompressed:
 			targetSize = -1
 		case !isSourceEncrypted && !isTargetEncrypted:
@@ -1625,7 +1753,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			pReader.setChecksumReader(checksumReader)
 		}
 
-		if isTargetEncrypted {
+		if isTargetEncrypted && !remoteCallRequired {
 			var encReader io.Reader
 			kind, _ := crypto.IsRequested(r.Header)
 			encReader, objEncKey, err = newEncryptReader(ctx, srcInfo.Reader, kind, newKeyID, newKey, dstBucket, dstObject, encMetadata, kmsCtx)
@@ -1649,7 +1777,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			return
 		}
 
-		if isTargetEncrypted {
+		if isTargetEncrypted && !remoteCallRequired {
 			pReader, err = pReader.WithEncryption(srcInfo.Reader, &objEncKey)
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -1669,6 +1797,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	// source timestamp is newer than the stored one, and a stale update must
 	// leave the stored state in place instead of erasing it.
 	storedLock := storedObjectLockState(srcInfo.UserDefined)
+	storedTagTimestamp := srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]
 
 	srcInfo.UserDefined, err = getCpObjMetadataFromHeader(ctx, r, srcInfo.UserDefined, allowReplicationMetadata)
 	if err != nil {
@@ -1686,23 +1815,29 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	if objTags != "" {
-		lastTaggingTimestamp := srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]
-		if dstOpts.ReplicationRequest {
-			srcTimestamp := dstOpts.ReplicationSourceTaggingTimestamp
-			if !srcTimestamp.IsZero() {
-				ondiskTimestamp, err := time.Parse(time.RFC3339Nano, lastTaggingTimestamp)
-				// update tagging metadata only if replica  timestamp is newer than what's on disk
-				if err != nil || (err == nil && !ondiskTimestamp.After(srcTimestamp)) {
-					srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = srcTimestamp.UTC().Format(time.RFC3339Nano)
-					srcInfo.UserDefined[xhttp.AmzObjectTagging] = objTags
-				}
-			}
-		} else {
+	if dstOpts.ReplicationRequest {
+		srcTimestamp := dstOpts.ReplicationSourceTaggingTimestamp
+		if !srcTimestamp.IsZero() {
+			// An empty value with a timestamp is an ordered deletion. Recheck
+			// the captured state even if metadata REPLACE rebuilt the map.
+			srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = srcTimestamp.UTC().Format(time.RFC3339Nano)
 			srcInfo.UserDefined[xhttp.AmzObjectTagging] = objTags
-			srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = UTCNow().Format(time.RFC3339Nano)
+			reconcileStoredObjectTags(srcInfo.UserDefined, srcInfo.UserTags, storedTagTimestamp)
+		} else {
+			srcInfo.UserDefined[xhttp.AmzObjectTagging] = srcInfo.UserTags
+			if storedTagTimestamp != "" {
+				srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = storedTagTimestamp
+			} else {
+				delete(srcInfo.UserDefined, ReservedMetadataPrefixLower+TaggingTimestamp)
+			}
 		}
+	} else {
+		srcInfo.UserDefined[xhttp.AmzObjectTagging] = objTags
+		srcInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = UTCNow().Format(time.RFC3339Nano)
 	}
+	// SSE-C rotation snapshots reserved metadata before the tag decision. Its
+	// later merge must not put the old timestamp back over the accepted state.
+	delete(encMetadata, ReservedMetadataPrefixLower+TaggingTimestamp)
 
 	srcInfo.UserDefined = filterReplicationStatusMetadata(srcInfo.UserDefined)
 	srcInfo.UserDefined = objectlock.FilterObjectLockMetadata(srcInfo.UserDefined, true, true)
@@ -1712,35 +1847,28 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 
 	// apply default bucket configuration/governance headers for dest side.
 	retentionMode, retentionDate, legalHold, s3Err := checkPutObjectLockAllowed(ctx, r, dstBucket, dstObject, getObjectInfo, retPerms, holdPerms, replicaTrusted)
-	if s3Err == ErrNone && retentionMode.Valid() {
-		if dstOpts.ReplicationRequest {
-			srcTimestamp := dstOpts.ReplicationSourceRetentionTimestamp
-			if storedLock.retentionIsOlderThan(srcTimestamp) {
-				srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockMode)] = string(retentionMode)
-				srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = amztime.ISO8601Format(retentionDate.UTC())
-				srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = srcTimestamp.UTC().Format(time.RFC3339Nano)
-			} else {
-				storedLock.restoreRetention(srcInfo.UserDefined)
-			}
-		} else {
-			srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockMode)] = string(retentionMode)
-			srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = amztime.ISO8601Format(retentionDate.UTC())
-			srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp] = UTCNow().Format(time.RFC3339Nano)
-		}
-	}
+	if s3Err == ErrNone {
+		applyReplicatedObjectLock(srcInfo.UserDefined, storedLock, replicaTrusted,
+			retentionMode, retentionDate, legalHold,
+			dstOpts.ReplicationSourceRetentionTimestamp, dstOpts.ReplicationSourceLegalholdTimestamp)
+		dstOpts.ReplicaLockReconcile = replicaTrusted && dstOpts.VersionID != ""
 
-	if s3Err == ErrNone && legalHold.Status.Valid() {
-		if dstOpts.ReplicationRequest {
-			srcTimestamp := dstOpts.ReplicationSourceLegalholdTimestamp
-			if storedLock.legalHoldIsOlderThan(srcTimestamp) {
-				srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = string(legalHold.Status)
-				srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = srcTimestamp.UTC().Format(time.RFC3339Nano)
-			} else {
-				storedLock.restoreLegalHold(srcInfo.UserDefined)
+		if replicaTrusted {
+			// An SSE-C key rotation snapshots every stored reserved key into
+			// encMetadata above, before this decision exists, and the merge that
+			// preserves the encryption headers would put the stored ordering
+			// timestamps back over it. For a trusted replica the decision just
+			// made is authoritative, so let the snapshot agree with it.
+			for _, key := range []string{
+				ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp,
+				ReservedMetadataPrefixLower + ObjectLockLegalHoldTimestamp,
+			} {
+				if value, ok := srcInfo.UserDefined[key]; ok {
+					encMetadata[key] = value
+				} else {
+					delete(encMetadata, key)
+				}
 			}
-		} else {
-			srcInfo.UserDefined[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = string(legalHold.Status)
-			srcInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = UTCNow().Format(time.RFC3339Nano)
 		}
 	}
 	if s3Err != ErrNone {
@@ -1810,9 +1938,6 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		srcInfo.metadataOnly = false
 	}
 
-	// Federation only.
-	remoteCallRequired := isRemoteCopyRequired(ctx, srcBucket, dstBucket, objectAPI)
-
 	var objInfo ObjectInfo
 	var os *objSweeper
 	if remoteCallRequired {
@@ -1834,23 +1959,109 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
-		// Remove the metadata for remote calls.
-		delete(srcInfo.UserDefined, ReservedMetadataPrefix+"compression")
-		delete(srcInfo.UserDefined, ReservedMetadataPrefix+"actual-size")
+		// A plain federated PutObject must not carry any internal storage
+		// metadata. The remote rejects every reserved-prefix header as a class
+		// (containsReservedMetadata), so strip the whole class here rather than
+		// an enumerated subset: an inline source object also carries
+		// inline-data, and replication bookkeeping adds still more, so removing
+		// only compression/actual-size just defers the next rejected key. Match
+		// the remote's case-insensitive detection.
+		for k := range srcInfo.UserDefined {
+			if stringsHasPrefixFold(k, ReservedMetadataPrefix) {
+				delete(srcInfo.UserDefined, k)
+			}
+		}
+		// Forward a clone: request-only keys are removed or added below and
+		// srcInfo.UserDefined stays the resolved record for the response.
+		forwardedMeta := cloneMSS(srcInfo.UserDefined)
+		// minio-go prefixes any UserMetadata key it does not recognize with
+		// x-amz-meta-, and it recognizes the retention headers but not
+		// x-amz-object-lock-legal-hold, so a hold left in the map reaches the
+		// remote as user metadata and is silently dropped (#166). Carry it on
+		// the typed option instead. Retention stays in the map: the typed
+		// RetainUntilDate would truncate the date to whole seconds.
+		legalHoldKey := strings.ToLower(xhttp.AmzObjectLockLegalHold)
+		forwardedLegalHold := forwardedMeta[legalHoldKey]
+		delete(forwardedMeta, legalHoldKey)
 		opts := miniogo.PutObjectOptions{
-			UserMetadata:         srcInfo.UserDefined,
+			UserMetadata:         forwardedMeta,
 			ServerSideEncryption: dstOpts.ServerSideEncryption,
 			UserTags:             tag.ToMap(),
+			LegalHold:            miniogo.LegalHoldStatus(forwardedLegalHold),
 		}
-		remoteObjInfo, rerr := core.PutObject(ctx, dstBucket, dstObject, srcInfo.Reader,
-			srcInfo.Size, "", "", opts)
+		// The destination must carry the same checksum the local path would
+		// produce; the federated path has the remote compute, validate, persist
+		// and return it. Without this the federated copy silently returns an
+		// empty checksum (#99).
+		wantChecksumType := dstOpts.WantServerSideChecksumType
+		var checksumHeaderValue string
+		switch {
+		case wantChecksumType.IsSet():
+			if actualSize == 0 {
+				// minio-go streams no trailing checksum for an empty body, so the
+				// remote would compute none, the bind below would fail, and every
+				// empty-object federated copy would 500. Forward the empty-content
+				// digest as an ordinary checksum header instead, so the remote
+				// validates, persists and returns it (parity with the local path,
+				// e.g. CRC32 "AAAAAA==").
+				if empty := hash.NewChecksumFromData(wantChecksumType, nil); empty != nil {
+					checksumHeaderValue = empty.Encoded
+				}
+			} else {
+				// Stream a trailing checksum of the requested type so the remote
+				// computes and persists it over the copied bytes.
+				opts.Checksum = federatedChecksumType(wantChecksumType)
+			}
+		case dstOpts.WantChecksum != nil && dstOpts.WantChecksum.Type.IsSet():
+			// A full-object checksum inherited from a checksum-bearing source: the
+			// local path persists it without recomputation (only multipart
+			// composite sources are promoted to WantServerSideChecksumType above,
+			// so this is never composite). Forward the value as an ordinary
+			// checksum header so the remote validates and persists it, and bind
+			// the returned value below. WantChecksum.Encoded is always a plain
+			// digest, never a "-N" multipart form.
+			wantChecksumType = dstOpts.WantChecksum.Type.Base()
+			checksumHeaderValue = dstOpts.WantChecksum.Encoded
+		}
+		if checksumHeaderValue != "" {
+			opts.UserMetadata[wantChecksumType.Key()] = checksumHeaderValue
+		}
+		// For an ordinary federated copy, actualSize is the logical plaintext
+		// length to declare. srcInfo.Size is not a reliable wire length because
+		// the read path may already have adjusted it.
+		writeCtx, modified := withFederatedWriteTime(ctx)
+		remoteObjInfo, rerr := core.PutObject(writeCtx, dstBucket, dstObject, srcInfo.Reader,
+			actualSize, "", "", opts)
 		if rerr != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, rerr), r.URL)
 			return
 		}
-		objInfo.UserDefined = cloneMSS(opts.UserMetadata)
+		// Keep the resolved legal hold in response and event metadata; the
+		// request-only checksum header exists only in the forwarding map.
+		objInfo.UserDefined = cloneMSS(srcInfo.UserDefined)
+		// The response headers and the ObjectCreated:Copy event describe the
+		// object this handler wrote, so name it: without these the response
+		// carries no x-amz-version-id and the event has an empty key and zero
+		// size (#170). Size is the logical size the remote was handed, which is
+		// what it reports back.
+		objInfo.Bucket = dstBucket
+		objInfo.Name = dstObject
+		objInfo.Size = actualSize
+		objInfo.VersionID = remoteObjInfo.VersionID
 		objInfo.ETag = remoteObjInfo.ETag
-		objInfo.ModTime = remoteObjInfo.LastModified
+		objInfo.ModTime = *modified
+		// Bind the checksum the remote computed for this exact write. A single
+		// forwarded PutObject must yield a full-object digest, so reject a
+		// missing, malformed, or multipart-marked ("-N") value rather than
+		// mislabel the destination as composite.
+		if wantChecksumType.IsSet() {
+			cs := hash.NewChecksumWithType(wantChecksumType, federatedChecksumValue(wantChecksumType, remoteObjInfo))
+			if cs == nil || cs.Type.Is(hash.ChecksumMultipart) {
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInternalError), r.URL)
+				return
+			}
+			objInfo.Checksum = cs.AppendTo(nil, nil)
+		}
 	} else {
 		os = newObjSweeper(dstBucket, dstObject).WithVersioning(dstOpts.Versioned, dstOpts.VersionSuspended)
 		// Get appropriate object info to identify the remote object to delete
@@ -2087,11 +2298,18 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		delete(metadata, xhttp.AmzBucketReplicationStatus)
 	}
 
-	// Check if bucket encryption is enabled
-	sseConfig, _ := globalBucketSSEConfigSys.Get(bucket)
-	sseConfig.Apply(r.Header, sse.ApplyOptions{
-		AutoEncrypt: globalAutoEncryption,
-	})
+	// A validated raw SSE-C replica carries the source ciphertext and the
+	// source seal. Its bytes must be stored verbatim: default encryption would
+	// overwrite the SSE-C IV and compression would invalidate the ciphertext.
+	rawSSECReplica := isRawSSECReplica(r.Header, replicaTrusted)
+
+	if !rawSSECReplica {
+		// Check if bucket encryption is enabled
+		sseConfig, _ := globalBucketSSEConfigSys.Get(bucket)
+		sseConfig.Apply(r.Header, sse.ApplyOptions{
+			AutoEncrypt: globalAutoEncryption,
+		})
+	}
 
 	var reader io.Reader
 	reader = rd
@@ -2102,10 +2320,13 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+	if opts.ReplicationRequest && !opts.ReplicationSourceTaggingTimestamp.IsZero() {
+		metadata[ReservedMetadataPrefixLower+TaggingTimestamp] = opts.ReplicationSourceTaggingTimestamp.UTC().Format(time.RFC3339Nano)
+	}
 
 	actualSize := size
 	var idxCb func() []byte
-	if isCompressible(r.Header, object) && size > minCompressibleSize {
+	if !rawSSECReplica && isCompressible(r.Header, object) && size > minCompressibleSize {
 		// Storing the compression metadata.
 		metadata[ReservedMetadataPrefix+"compression"] = compressionAlgorithmV2
 		metadata[ReservedMetadataPrefix+"actual-size"] = strconv.FormatInt(size, 10)
@@ -2170,9 +2391,21 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		r.Header.Get(xhttp.IfMatch) != "" ||
 		r.Header.Get(xhttp.IfNoneMatch) != "" {
 		opts.CheckPrecondFn = func(oi ObjectInfo) bool {
-			if _, err := DecryptObjectInfo(&oi, r); err != nil {
-				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-				return true
+			// A pure raw SSE-C replica overwrite (no public precondition) fully
+			// replaces the stored object, so the destination must not first
+			// require the stored object to decrypt: a replica an older destination
+			// bug left as compress(ciphertext) or double-encrypted has an invalid
+			// decrypted length, and requiring it here blocks the retransmission
+			// that repairs it. The predicate is the incoming request's restored
+			// SSE-C metadata, the same one checkPreconditionsPUT uses to exempt the
+			// version/ETag duplicate. A conditional request (If-Match/If-None-Match)
+			// still needs the decrypted, client-visible ETag, so it keeps the check.
+			ssecReplica := isReplicaTrusted(ctx) && crypto.SSEC.IsEncrypted(opts.UserDefined)
+			if !ssecReplica || r.Header.Get(xhttp.IfMatch) != "" || r.Header.Get(xhttp.IfNoneMatch) != "" {
+				if _, err := DecryptObjectInfo(&oi, r); err != nil {
+					writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+					return true
+				}
 			}
 			return checkPreconditionsPUT(ctx, w, r, oi, opts)
 		}
@@ -2184,12 +2417,29 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	getObjectInfo := objectAPI.GetObjectInfo
 
 	retentionMode, retentionDate, legalHold, s3Err := checkPutObjectLockAllowed(ctx, r, bucket, object, getObjectInfo, retPerms, holdPerms, isReplicaTrusted(ctx))
-	if s3Err == ErrNone && retentionMode.Valid() {
-		metadata[strings.ToLower(xhttp.AmzObjectLockMode)] = string(retentionMode)
-		metadata[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = amztime.ISO8601Format(retentionDate.UTC())
-	}
-	if s3Err == ErrNone && legalHold.Status.Valid() {
-		metadata[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = string(legalHold.Status)
+	if s3Err == ErrNone {
+		// A trusted replica write addressing a specific version can be a full
+		// retransmit over an existing version whose lock state is newer than the
+		// source snapshot (issue #120). Order the incoming update against what is
+		// stored so a stale value cannot overwrite it; a non-replica write (and a
+		// marker-only peer write) has no stored state to order against and takes
+		// the helper's ordinary-write branch.
+		var storedLock objectLockState
+		if isReplicaTrusted(ctx) && opts.VersionID != "" {
+			var lerr error
+			if storedLock, lerr = replicaStoredLock(ctx, getObjectInfo, bucket, object, opts.VersionID); lerr != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, lerr), r.URL)
+				return
+			}
+		}
+		applyReplicatedObjectLock(metadata, storedLock, isReplicaTrusted(ctx),
+			retentionMode, retentionDate, legalHold,
+			opts.ReplicationSourceRetentionTimestamp, opts.ReplicationSourceLegalholdTimestamp)
+		// The decision above orders against the version as read here; let the
+		// object layer re-run it against the version read under the write lock
+		// that guards the replacement, so a newer hold or retention committed in
+		// between is not rolled back, across all pools and encryption modes.
+		opts.ReplicaLockReconcile = isReplicaTrusted(ctx) && opts.VersionID != ""
 	}
 	if s3Err != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
@@ -2200,7 +2450,10 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		metadata[ReservedMetadataPrefixLower+ReplicationStatus] = dsc.PendingStatus()
 	}
 	var objectEncryptionKey crypto.ObjectKey
-	if crypto.Requested(r.Header) {
+	// rawSSECReplica also gates the branch itself, not just the default-SSE
+	// header that would normally reach it: a trusted peer that sends an
+	// explicit public SSE header alongside a source seal must not re-encrypt.
+	if !rawSSECReplica && crypto.Requested(r.Header) {
 		if crypto.SSECopy.IsRequested(r.Header) {
 			writeErrorResponse(ctx, w, toAPIError(ctx, errInvalidEncryptionParameters), r.URL)
 			return
@@ -2301,6 +2554,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	setPutObjHeaders(w, objInfo, false, r.Header)
+	setFederatedWriteTime(w, r, objInfo.ModTime)
 
 	// Notify object created event.
 	evt := eventArgs{
@@ -2846,6 +3100,20 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// If-Match conditional delete (see AWS S3 conditional deletes). Delete the
+	// object only if its current ETag matches the client-supplied value,
+	// otherwise the request is refused with 412 Precondition Failed and the
+	// object is left intact. The precondition is evaluated in
+	// erasureServerPools.DeleteObject, against the version that will actually be
+	// removed, while the delete lock is held, so the object cannot change
+	// between the ETag check and the delete.
+	if ifMatch := r.Header.Get(xhttp.IfMatch); ifMatch != "" {
+		opts.HasIfMatch = true
+		opts.CheckPrecondFn = func(oi ObjectInfo) bool {
+			return deleteIfMatchPreconditionFailed(r.Header, ifMatch, oi)
+		}
+	}
+
 	rcfg, _ := globalBucketObjectLockSys.Get(bucket)
 	if rcfg.LockEnabled && opts.DeletePrefix {
 		apiErr := toAPIError(ctx, errInvalidArgument)
@@ -2911,6 +3179,13 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 			return
 		}
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+			if opts.HasIfMatch {
+				// A conditional (If-Match) delete cannot satisfy its
+				// precondition against a missing object, so surface the
+				// not-found error instead of the idempotent 204 response.
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+				return
+			}
 			// Send an event when the object is not found
 			objInfo.Name = object
 			objInfo.VersionID = opts.VersionID
@@ -2957,7 +3232,7 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 	if objInfo.ReplicationStatus == replication.Pending || objInfo.VersionPurgeStatus == replication.VersionPurgePending {
 		dmVersionID := ""
 		versionID := ""
-		if objInfo.DeleteMarker {
+		if objInfo.DeleteMarker && objInfo.VersionPurgeStatus.Empty() {
 			dmVersionID = objInfo.VersionID
 		} else {
 			versionID = objInfo.VersionID
@@ -3432,15 +3707,18 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 	}
 	tagsStr := tags.String()
 
-	// Set this such that authorization policies can be applied on the object tags.
-	r.Header.Set(xhttp.AmzObjectTagging, tagsStr)
-
 	logger.GetReqInfo(ctx).BucketName = bucket
 	logger.GetReqInfo(ctx).ObjectName = object
 	if s3Error := authenticateRequest(ctx, r, policy.PutObjectTaggingAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
+
+	// Set this such that authorization policies can be applied on the object
+	// tags. This is derived from the request body, so it must be injected only
+	// after signature verification: the SigV4 verifier now rejects unsigned
+	// x-amz-* request headers, and this synthesized header is never signed.
+	r.Header.Set(xhttp.AmzObjectTagging, tagsStr)
 
 	opts, err := getOpts(ctx, r, bucket, object)
 	if err != nil {
@@ -3492,11 +3770,11 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 	}
 
 	dsc := mustReplicate(ctx, bucket, object, getMustReplicateOptions(objInfo.UserDefined, tagsStr, objInfo.ReplicationStatus, replication.MetadataReplicationType, opts))
+	stamp := UTCNow().Format(time.RFC3339Nano)
+	opts.UserDefined = map[string]string{ReservedMetadataPrefixLower + TaggingTimestamp: stamp}
 	if dsc.ReplicateAny() {
-		opts.UserDefined = make(map[string]string)
-		opts.UserDefined[ReservedMetadataPrefixLower+ReplicationTimestamp] = UTCNow().Format(time.RFC3339Nano)
+		opts.UserDefined[ReservedMetadataPrefixLower+ReplicationTimestamp] = stamp
 		opts.UserDefined[ReservedMetadataPrefixLower+ReplicationStatus] = dsc.PendingStatus()
-		opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = UTCNow().Format(time.RFC3339Nano)
 	}
 
 	// Put object tags
@@ -3595,9 +3873,10 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 	}
 
 	dsc := mustReplicate(ctx, bucket, object, oi.getMustReplicateOptions(replication.MetadataReplicationType, opts))
+	stamp := UTCNow().Format(time.RFC3339Nano)
+	opts.UserDefined = map[string]string{ReservedMetadataPrefixLower + TaggingTimestamp: stamp}
 	if dsc.ReplicateAny() {
-		opts.UserDefined = make(map[string]string)
-		opts.UserDefined[ReservedMetadataPrefixLower+ReplicationTimestamp] = UTCNow().Format(time.RFC3339Nano)
+		opts.UserDefined[ReservedMetadataPrefixLower+ReplicationTimestamp] = stamp
 		opts.UserDefined[ReservedMetadataPrefixLower+ReplicationStatus] = dsc.PendingStatus()
 	}
 

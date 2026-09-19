@@ -29,7 +29,7 @@ cleanup
 export MINIO_CI_CD=1
 export MINIO_BROWSER=off
 export MINIO_ROOT_USER="minio"
-export MINIO_ROOT_PASSWORD="silo123"
+export MINIO_ROOT_PASSWORD="silo12345"
 TEST_MINIO_ENC_KEY="MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDA"
 
 # Create certificates for TLS enabled Silo
@@ -43,8 +43,8 @@ echo "done"
 
 # Start Silo instances
 echo -n "Starting Silo instances ..."
-CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo123 silo server --certs-dir /tmp/certs --address ":9001" --console-address ":10000" /tmp/silo1/{1...4}/disk{1...4} /tmp/silo1/{5...8}/disk{1...4} >/tmp/silo1_1.log 2>&1 &
-CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo123 silo server --certs-dir /tmp/certs --address ":9002" --console-address ":11000" /tmp/silo2/{1...4}/disk{1...4} /tmp/silo2/{5...8}/disk{1...4} >/tmp/silo2_1.log 2>&1 &
+CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo12345 silo server --certs-dir /tmp/certs --address ":9001" --console-address ":10000" /tmp/silo1/{1...4}/disk{1...4} /tmp/silo1/{5...8}/disk{1...4} >/tmp/silo1_1.log 2>&1 &
+CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo12345 silo server --certs-dir /tmp/certs --address ":9002" --console-address ":11000" /tmp/silo2/{1...4}/disk{1...4} /tmp/silo2/{5...8}/disk{1...4} >/tmp/silo2_1.log 2>&1 &
 echo "done"
 
 if [ ! -f ./mc ]; then
@@ -53,8 +53,8 @@ if [ ! -f ./mc ]; then
 	echo "done"
 fi
 
-export MC_HOST_silo1=https://minio:silo123@localhost:9001
-export MC_HOST_silo2=https://minio:silo123@localhost:9002
+export MC_HOST_silo1=https://minio:silo12345@localhost:9001
+export MC_HOST_silo2=https://minio:silo12345@localhost:9002
 
 ./mc ready silo1 --insecure
 ./mc ready silo2 --insecure
@@ -232,12 +232,12 @@ fi
 ./mc cat silo2/test-bucket/custpartsize --insecure >/dev/null || exit_1
 
 echo -n "Starting Silo instances with different kms key ..."
-CI=on MINIO_KMS_SECRET_KEY=silo3-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo123 silo server --certs-dir /tmp/certs --address ":9003" --console-address ":10000" /tmp/silo3/disk{1...4} >/tmp/silo3_1.log 2>&1 &
-CI=on MINIO_KMS_SECRET_KEY=silo4-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo123 silo server --certs-dir /tmp/certs --address ":9004" --console-address ":11000" /tmp/silo4/disk{1...4} >/tmp/silo4_1.log 2>&1 &
+CI=on MINIO_KMS_SECRET_KEY=silo3-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo12345 silo server --certs-dir /tmp/certs --address ":9003" --console-address ":10000" /tmp/silo3/disk{1...4} >/tmp/silo3_1.log 2>&1 &
+CI=on MINIO_KMS_SECRET_KEY=silo4-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo12345 silo server --certs-dir /tmp/certs --address ":9004" --console-address ":11000" /tmp/silo4/disk{1...4} >/tmp/silo4_1.log 2>&1 &
 echo "done"
 
-export MC_HOST_silo3=https://minio:silo123@localhost:9003
-export MC_HOST_silo4=https://minio:silo123@localhost:9004
+export MC_HOST_silo3=https://minio:silo12345@localhost:9003
+export MC_HOST_silo4=https://minio:silo12345@localhost:9004
 
 ./mc ready silo3 --insecure
 ./mc ready silo4 --insecure

@@ -25,7 +25,7 @@ cleanup
 export MINIO_CI_CD=1
 export MINIO_BROWSER=off
 export MINIO_ROOT_USER="minio"
-export MINIO_ROOT_PASSWORD="silo123"
+export MINIO_ROOT_PASSWORD="silo12345"
 TEST_MINIO_ENC_KEY="MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDA"
 
 # Create certificates for TLS enabled Silo
@@ -49,8 +49,8 @@ if [ ! -f ./mc ]; then
 	echo "done"
 fi
 
-export MC_HOST_silo1=https://minio:silo123@localhost:9001
-export MC_HOST_silo2=https://minio:silo123@localhost:9002
+export MC_HOST_silo1=https://minio:silo12345@localhost:9001
+export MC_HOST_silo2=https://minio:silo12345@localhost:9002
 
 ./mc ready silo1 --insecure
 ./mc ready silo2 --insecure

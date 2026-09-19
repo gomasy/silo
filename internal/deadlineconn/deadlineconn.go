@@ -34,6 +34,8 @@ type DeadlineConn struct {
 	net.Conn
 	readDeadline            time.Duration // sets the read deadline on a connection.
 	readSetAt               time.Time
+	readExplicit            time.Time     // last deadline requested by the caller.
+	readDeadlineStrict      bool          // idle renewal must not extend readExplicit.
 	writeDeadline           time.Duration // sets the write deadline on a connection.
 	writeSetAt              time.Time
 	abortReads, abortWrites atomic.Bool // A deadline was set to indicate caller wanted the conn to time out.
@@ -59,15 +61,29 @@ func (c *DeadlineConn) setReadDeadline() {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.abortReads.Load() {
+	if c.abortReads.Load() || c.infReads.Load() {
 		return
 	}
 
 	now := time.Now()
 	if now.Sub(c.readSetAt) > updateInterval {
-		c.Conn.SetReadDeadline(now.Add(c.readDeadline + updateInterval))
+		deadline := now.Add(c.readDeadline + updateInterval)
+		if c.readDeadlineStrict && !c.readExplicit.IsZero() && c.readExplicit.Before(deadline) {
+			deadline = c.readExplicit
+		}
+		c.Conn.SetReadDeadline(deadline)
 		c.readSetAt = now
 	}
+}
+
+// SetReadDeadlineStrict controls whether idle renewal may extend a deadline set
+// by SetReadDeadline or SetDeadline. The default is false. Explicit zero and
+// past deadlines retain their disable/cancel semantics in either mode.
+func (c *DeadlineConn) SetReadDeadlineStrict(strict bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readDeadlineStrict = strict
+	c.readSetAt = time.Time{}
 }
 
 func (c *DeadlineConn) setWriteDeadline() {
@@ -115,6 +131,7 @@ func (c *DeadlineConn) SetDeadline(t time.Time) error {
 	defer c.mu.Unlock()
 
 	c.readSetAt = time.Time{}
+	c.readExplicit = t
 	c.writeSetAt = time.Time{}
 	c.abortReads.Store(!t.IsZero() && time.Until(t) < 0)
 	c.abortWrites.Store(!t.IsZero() && time.Until(t) < 0)
@@ -132,6 +149,7 @@ func (c *DeadlineConn) SetReadDeadline(t time.Time) error {
 	c.abortReads.Store(!t.IsZero() && time.Until(t) < 0)
 	c.infReads.Store(t.IsZero())
 	c.readSetAt = time.Time{}
+	c.readExplicit = t
 	return c.Conn.SetReadDeadline(t)
 }
 

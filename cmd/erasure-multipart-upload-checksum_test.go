@@ -157,6 +157,13 @@ func copyPartWithoutChecksumHTTP(t *testing.T, apiRouter http.Handler, creds aut
 	if sourceRange != "" {
 		req.Header.Set(xhttp.AmzCopySourceRange, sourceRange)
 	}
+	// Re-sign so the copy-source x-amz-* headers are covered by the signature,
+	// as real S3 clients send them; the verifier rejects unsigned x-amz-*.
+	if creds.AccessKey != "" && creds.SecretKey != "" {
+		if err := signRequestV4(req, creds.AccessKey, creds.SecretKey); err != nil {
+			t.Fatalf("failed to re-sign UploadPartCopy request: %v", err)
+		}
+	}
 	rec := httptest.NewRecorder()
 	apiRouter.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

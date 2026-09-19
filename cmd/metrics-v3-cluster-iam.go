@@ -34,6 +34,10 @@ const (
 	sinceLastSyncMillis                    = "since_last_sync_millis"
 	syncFailures                           = "sync_failures"
 	syncSuccesses                          = "sync_successes"
+	revocationRecords                      = "revocation_records"
+	revocationHealFailures                 = "revocation_heal_failures"
+	revocationHealDurationMillis           = "revocation_heal_duration_millis"
+	revocationHealLastSuccess              = "revocation_heal_last_success_timestamp_seconds"
 )
 
 var (
@@ -47,10 +51,20 @@ var (
 	sinceLastSyncMillisMD                    = NewCounterMD(sinceLastSyncMillis, "Time (in milliseconds) since last successful IAM data sync.")
 	syncFailuresMD                           = NewCounterMD(syncFailures, "Number of failed IAM data syncs since server start.")
 	syncSuccessesMD                          = NewCounterMD(syncSuccesses, "Number of successful IAM data syncs since server start.")
+	revocationRecordsMD                      = NewGaugeMD(revocationRecords, "Retained IAM deletion records and revocation boundaries in this node's index.")
+	revocationHealFailuresMD                 = NewCounterMD(revocationHealFailures, "Failed IAM revocation convergence passes since server start.")
+	revocationHealDurationMillisMD           = NewGaugeMD(revocationHealDurationMillis, "Duration of the last IAM revocation convergence pass in milliseconds.")
+	revocationHealLastSuccessMD              = NewGaugeMD(revocationHealLastSuccess, "Unix timestamp of the last successful IAM revocation convergence pass.")
 )
 
 // loadClusterIAMMetrics - `MetricsLoaderFn` for cluster IAM metrics.
 func loadClusterIAMMetrics(_ context.Context, m MetricValues, _ *metricsCache) error {
+	if globalIAMSys.Initialized() {
+		m.Set(revocationRecords, float64(globalIAMSys.store.revisionIndex().count()))
+	}
+	m.Set(revocationHealFailures, float64(globalSiteReplicationSys.iamRevisionMetrics.healFailures.Load()))
+	m.Set(revocationHealDurationMillis, float64(globalSiteReplicationSys.iamRevisionMetrics.healDurationMillis.Load()))
+	m.Set(revocationHealLastSuccess, float64(globalSiteReplicationSys.iamRevisionMetrics.healLastSuccess.Load()))
 	m.Set(lastSyncDurationMillis, float64(atomic.LoadUint64(&globalIAMSys.LastRefreshDurationMilliseconds)))
 	pluginAuthNMetrics := globalAuthNPlugin.Metrics()
 	m.Set(pluginAuthnServiceFailedRequestsMinute, float64(pluginAuthNMetrics.FailedRequests))

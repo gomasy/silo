@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
@@ -125,19 +126,42 @@ func (sys *BucketMetadataSys) Set(bucket string, meta BucketMetadata) {
 	}
 }
 
-func (sys *BucketMetadataSys) updateAndParse(ctx context.Context, bucket string, configFile string, configData []byte, parse, lifecycleDelete bool) (updatedAt time.Time, err error) {
+// bucketMetadataUpdate returns the committed snapshot to the caller. meta and
+// updatedAt hold the saved state only when changed is true. Local writes always
+// change state, because localBucketConfigUpdatedAt is strictly greater than the
+// current field time, so their handlers can broadcast meta without rechecking.
+type bucketMetadataUpdate struct {
+	meta      BucketMetadata
+	updatedAt time.Time
+	changed   bool
+}
+
+func (sys *BucketMetadataSys) updateAndParse(ctx context.Context, bucket, configFile string, configData []byte, parse, lifecycleDelete bool) (time.Time, error) {
+	result, err := sys.updateAndParseMetadata(ctx, bucket, configFile, configData, parse, lifecycleDelete, nil)
+	return result.updatedAt, err
+}
+
+func (sys *BucketMetadataSys) updateAndParseMetadata(ctx context.Context, bucket string, configFile string, configData []byte, parse, lifecycleDelete bool, sourceTime *time.Time) (result bucketMetadataUpdate, err error) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
-		return updatedAt, errServerNotInitialized
+		return result, errServerNotInitialized
 	}
 
 	if isMinioMetaBucketName(bucket) {
-		return updatedAt, errInvalidArgument
+		return result, errInvalidArgument
+	}
+	// Load deletions without parsed caches (notably quota), and compare the
+	// six replicated fields against the raw document under the same lock.
+	if isReplicatedBucketConfig(configFile) {
+		parse = false
+		if bucketConfigUpdateOnly(configFile) && len(configData) == 0 {
+			return result, nil
+		}
 	}
 	notifyCtx := ctx
 	ctx, unlock, err := lockBucketMetadata(ctx, objAPI, bucket)
 	if err != nil {
-		return updatedAt, err
+		return result, err
 	}
 
 	err = func() error {
@@ -157,55 +181,73 @@ func (sys *BucketMetadataSys) updateAndParse(ctx context.Context, bucket string,
 				return err
 			}
 		}
-		updatedAt = UTCNow()
-		switch configFile {
-		case bucketPolicyConfig:
-			meta.PolicyConfigJSON = configData
-			meta.PolicyConfigUpdatedAt = updatedAt
-		case bucketNotificationConfig:
-			meta.NotificationConfigXML = configData
-			meta.NotificationConfigUpdatedAt = updatedAt
-		case bucketLifecycleConfig:
-			meta.LifecycleConfigXML = configData
-			meta.LifecycleConfigUpdatedAt = updatedAt
-		case bucketSSEConfig:
-			meta.EncryptionConfigXML = configData
-			meta.EncryptionConfigUpdatedAt = updatedAt
-		case bucketTaggingConfig:
-			meta.TaggingConfigXML = configData
-			meta.TaggingConfigUpdatedAt = updatedAt
-		case bucketQuotaConfigFile:
-			meta.QuotaConfigJSON = configData
-			meta.QuotaConfigUpdatedAt = updatedAt
-		case objectLockConfig:
-			meta.ObjectLockConfigXML = configData
-			meta.ObjectLockConfigUpdatedAt = updatedAt
-		case bucketVersioningConfig:
-			meta.VersioningConfigXML = configData
-			meta.VersioningConfigUpdatedAt = updatedAt
-		case bucketReplicationConfig:
-			meta.ReplicationConfigXML = configData
-			meta.ReplicationConfigUpdatedAt = updatedAt
-		case bucketTargetsFile:
-			meta.BucketTargetsConfigJSON, meta.BucketTargetsConfigMetaJSON, err = encryptBucketMetadata(ctx, meta.Name, configData, kms.Context{
-				bucket:            meta.Name,
-				bucketTargetsFile: bucketTargetsFile,
-			})
-			if err != nil {
-				return fmt.Errorf("Error encrypting bucket target metadata %w", err)
+		updatedAt := UTCNow()
+		if isReplicatedBucketConfig(configFile) {
+			if err := ensureBucketMetadataCreated(ctx, objAPI, &meta); err != nil {
+				var at time.Time
+				if sourceTime != nil {
+					at = *sourceTime
+				}
+				logBucketConfigReplication(ctx, bucket, configFile, "indeterminate", at, meta.Created, err.Error())
+				return err
 			}
-			meta.BucketTargetsConfigUpdatedAt = updatedAt
-			meta.BucketTargetsConfigMetaUpdatedAt = updatedAt
-		default:
-			return fmt.Errorf("Unknown bucket %s metadata update requested %s", bucket, configFile)
+			if sourceTime == nil || sourceTime.IsZero() {
+				updatedAt = localBucketConfigUpdatedAt(meta, configFile, updatedAt)
+				if sourceTime != nil {
+					logBucketConfigReplication(ctx, bucket, configFile, "legacy-zero", *sourceTime, meta.Created, "assigned local source time")
+				}
+			} else {
+				updatedAt = sourceTime.UTC()
+			}
+			if updatedAt.Before(meta.Created) {
+				logBucketConfigReplication(ctx, bucket, configFile, "before-created", updatedAt, meta.Created, "peer event")
+				return nil
+			}
+			changed, err := applyBucketConfig(&meta, configFile, configData, updatedAt)
+			if err != nil {
+				return err
+			}
+			if !changed {
+				return nil
+			}
+		} else {
+			switch configFile {
+			case bucketNotificationConfig:
+				meta.NotificationConfigXML = configData
+				meta.NotificationConfigUpdatedAt = updatedAt
+			case bucketLifecycleConfig:
+				meta.LifecycleConfigXML = configData
+				meta.LifecycleConfigUpdatedAt = updatedAt
+			case bucketReplicationConfig:
+				meta.ReplicationConfigXML = configData
+				meta.ReplicationConfigUpdatedAt = updatedAt
+			case bucketTargetsFile:
+				meta.BucketTargetsConfigJSON, meta.BucketTargetsConfigMetaJSON, err = encryptBucketMetadata(ctx, meta.Name, configData, kms.Context{
+					bucket:            meta.Name,
+					bucketTargetsFile: bucketTargetsFile,
+				})
+				if err != nil {
+					return fmt.Errorf("Error encrypting bucket target metadata %w", err)
+				}
+				meta.BucketTargetsConfigUpdatedAt = updatedAt
+				meta.BucketTargetsConfigMetaUpdatedAt = updatedAt
+			default:
+				return fmt.Errorf("Unknown bucket %s metadata update requested %s", bucket, configFile)
+			}
 		}
-		return sys.saveMetadata(ctx, objAPI, meta)
+		if err := sys.saveMetadata(ctx, objAPI, &meta); err != nil {
+			return err
+		}
+		result = bucketMetadataUpdate{meta: meta, updatedAt: updatedAt, changed: true}
+		return nil
 	}()
 	if err != nil {
-		return updatedAt, err
+		return result, err
 	}
-	globalNotificationSys.LoadBucketMetadata(bgContext(notifyCtx), bucket) // Do not use caller context here
-	return updatedAt, nil
+	if result.changed {
+		globalNotificationSys.LoadBucketMetadata(bgContext(notifyCtx), bucket)
+	}
+	return result, nil
 }
 
 func (sys *BucketMetadataSys) save(ctx context.Context, meta BucketMetadata) error {
@@ -218,7 +260,7 @@ func (sys *BucketMetadataSys) save(ctx context.Context, meta BucketMetadata) err
 		return errInvalidArgument
 	}
 
-	if err := sys.saveMetadata(ctx, objAPI, meta); err != nil {
+	if err := sys.saveMetadata(ctx, objAPI, &meta); err != nil {
 		return err
 	}
 
@@ -228,11 +270,16 @@ func (sys *BucketMetadataSys) save(ctx context.Context, meta BucketMetadata) err
 
 // saveMetadata persists and publishes metadata locally. Callers performing a
 // read-modify-write must hold metadata.lock and release it before peer fan-out.
-func (sys *BucketMetadataSys) saveMetadata(ctx context.Context, objAPI ObjectLayer, meta BucketMetadata) error {
+func (sys *BucketMetadataSys) saveMetadata(ctx context.Context, objAPI ObjectLayer, meta *BucketMetadata) error {
+	// A writer may have queued for metadata.lock before DeleteBucket completed.
+	// Recheck the physical bucket under that lock, before recreating metadata.
+	if _, err := objAPI.GetBucketInfo(ctx, meta.Name, BucketOptions{NoMetadata: true}); err != nil {
+		return err
+	}
 	if err := meta.Save(ctx, objAPI); err != nil {
 		return err
 	}
-	sys.Set(meta.Name, meta)
+	sys.Set(meta.Name, *meta)
 	return nil
 }
 
@@ -240,8 +287,19 @@ func lockBucketMetadata(ctx context.Context, objectAPI ObjectLayer, bucket strin
 	return lockBucketMetadataWithTimeout(ctx, objectAPI, bucket, globalOperationTimeout)
 }
 
+// lockBucketMetadataAcquireHook, when set, is invoked at the start of every
+// metadata.lock acquisition, immediately before the blocking Lock() call. It is
+// nil in production (a single atomic load, no behavior change) and exists only
+// so tests can deterministically observe a caller reaching the metadata lock —
+// notably DeleteBucket, whose lock is taken through its erasureServerPools
+// receiver and is therefore invisible to an injected object layer.
+var lockBucketMetadataAcquireHook atomic.Pointer[func(bucket string)]
+
 func lockBucketMetadataWithTimeout(ctx context.Context, objectAPI ObjectLayer, bucket string, timeout *dynamicTimeout) (context.Context, func(), error) {
 	lock := objectAPI.NewNSLock(minioMetaBucket, pathJoin(bucketMetaPrefix, bucket, "metadata.lock"))
+	if hook := lockBucketMetadataAcquireHook.Load(); hook != nil {
+		(*hook)(bucket)
+	}
 	lkctx, err := lock.GetLock(ctx, timeout)
 	if err != nil {
 		return nil, nil, err
@@ -290,6 +348,57 @@ func lifecycleDeleteConfig(current []byte) ([]byte, error) {
 // The configData data should not be modified after being sent here.
 func (sys *BucketMetadataSys) Update(ctx context.Context, bucket string, configFile string, configData []byte) (updatedAt time.Time, err error) {
 	return sys.updateAndParse(ctx, bucket, configFile, configData, true, false)
+}
+
+// UpdateExpiryLCConfig merges a replicated ILM expiry configuration with the
+// bucket's current lifecycle document and persists the merged result while
+// holding metadata.lock across the read, merge, and save. The site-replication
+// expiry heal and peer-apply paths must use this instead of computing the merge
+// from an unlocked GetConfigFromDisk read and then writing it with Update: that
+// two-step sequence drops any lifecycle transition change committed in between
+// (issue #105). Lock order stays <bucket>.lck -> metadata.lock -> .metadata.bin;
+// the merge and save run under metadata.lock and the peer fan-out runs after it
+// is released.
+func (sys *BucketMetadataSys) UpdateExpiryLCConfig(ctx context.Context, bucket string, expLCConfig *string, updatedAt time.Time) error {
+	objAPI := newObjectLayerFn()
+	if objAPI == nil {
+		return errServerNotInitialized
+	}
+
+	if isMinioMetaBucketName(bucket) {
+		return errInvalidArgument
+	}
+
+	notifyCtx := ctx
+	ctx, unlock, err := lockBucketMetadata(ctx, objAPI, bucket)
+	if err != nil {
+		return err
+	}
+
+	err = func() error {
+		defer unlock()
+		meta, err := loadBucketMetadataParse(ctx, objAPI, bucket, true)
+		if err != nil {
+			if !globalIsErasure && !globalIsDistErasure && errors.Is(err, errVolumeNotFound) {
+				// Only single drive mode needs this fallback.
+				meta = newBucketMetadata(bucket)
+			} else {
+				return err
+			}
+		}
+		configData, err := mergeExpiryWithLCConfig(bucket, meta, expLCConfig, updatedAt)
+		if err != nil {
+			return err
+		}
+		meta.LifecycleConfigXML = configData
+		meta.LifecycleConfigUpdatedAt = UTCNow()
+		return sys.saveMetadata(ctx, objAPI, &meta)
+	}()
+	if err != nil {
+		return err
+	}
+	globalNotificationSys.LoadBucketMetadata(bgContext(notifyCtx), bucket) // Do not use caller context here
+	return nil
 }
 
 // Get metadata for a bucket.

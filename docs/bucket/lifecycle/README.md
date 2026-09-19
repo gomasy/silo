@@ -230,3 +230,7 @@ Note that transition event notification is a Silo extension.
 
 - [MinIO Go client API reference (S3-compatible SDK)](https://pkg.go.dev/github.com/minio/minio-go/v7)
 - [Object Lifecycle Management](https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lifecycle-mgmt.html)
+
+## Access-frequency tiering removal
+
+The opt-in cross-pool access-frequency extension has been removed. For upgrades from a main/snapshot build that included it, see [the migration notes](access-tiering-removal.md). Ordinary lifecycle expiration and remote-tier transitions remain supported.

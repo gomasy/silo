@@ -1,0 +1,82 @@
+// Copyright (c) 2026 Feng Ruohang
+//
+// This file is part of Silo Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+package cmd
+
+import (
+ "bytes"
+ "context"
+ "encoding/json"
+ "os"
+ "path/filepath"
+ "testing"
+ "time"
+
+ "github.com/minio/minio/internal/cachevalue"
+)
+
+// Run only on 89637554d, before access-tiering is removed. This uses the real
+// folder scanner and v9 serializer with synthetic file-size/tier summaries,
+// following TestDataUsageCacheSerialize; it does not relabel a v8 payload.
+func TestGenerateAccessRetirementV9Fixture(t *testing.T) {
+ if dataUsageCacheVerCurrent != 9 { t.Fatal("requires the historical v9 writer") }
+ base := t.TempDir()
+ const bucket = "v9-bucket"
+ createUsageTestFiles(t, base, bucket, []usageTestFile{
+  {name: "root", size: 1234},
+  {name: "nested/versions", size: 8192},
+  {name: "nested/remote", size: 65536},
+ })
+ getSize := func(item scannerItem) (s sizeSummary, err error) {
+  if item.Typ&os.ModeDir != 0 { return s, nil }
+  info, err := os.Stat(item.Path)
+  if err != nil { return s, err }
+  s.totalSize, s.hotTierSize, s.versions = info.Size(), info.Size(), 1
+  if filepath.Base(item.Path) == "versions" { s.versions, s.deleteMarkers = 3, 2 }
+  if filepath.Base(item.Path) == "remote" {
+   s.hotTierSize = 0
+   s.tiers = map[string]tierStats{"COLD": {TotalSize: uint64(info.Size()), NumVersions: 1, NumObjects: 1}}
+  }
+  return s, nil
+ }
+ xls := xlStorage{drivePath: base, diskInfoCache: cachevalue.New[DiskInfo]()}
+ xls.diskInfoCache.InitOnce(time.Second, cachevalue.Opts{}, func(context.Context) (DiskInfo,error) {
+  return DiskInfo{Total: 1<<40, Free: 1<<40}, nil
+ })
+ cache, err := scanDataFolder(t.Context(), nil, &xls, dataUsageCache{Info:dataUsageCacheInfo{Name:bucket, SkipHealing:true}}, getSize, 0, func()bool{return false})
+ if err != nil { t.Fatal(err) }
+ root := *cache.find(bucket)
+ cache.replace(dataUsageRoot, "", dataUsageEntry{})
+ cache.replace(bucket, dataUsageRoot, root)
+ cache.Info.Name = dataUsageRoot
+ cache.Info.LastUpdate = time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+ cache.Info.NextCycle = 42
+ flat := cache.flatten(*cache.root())
+ if flat.Size != 74962 || flat.Objects != 3 || flat.Versions != 5 || flat.DeleteMarkers != 2 || flat.HotTierSize != 9426 {
+  t.Fatalf("unexpected scanner fixture: %+v", flat)
+ }
+ var buf bytes.Buffer
+ if err := cache.serializeTo(&buf); err != nil { t.Fatal(err) }
+ dir := os.Getenv("SILO_RETIRE_FIXTURE_DIR")
+ if dir == "" { t.Fatal("SILO_RETIRE_FIXTURE_DIR required") }
+ if err := os.MkdirAll(dir, 0755); err != nil { t.Fatal(err) }
+ if err := os.WriteFile(filepath.Join(dir,"data-usage-v9.bin"),buf.Bytes(),0644);err != nil{t.Fatal(err)}
+ expected, err := json.MarshalIndent(cache,"","  ")
+ if err != nil { t.Fatal(err) }
+ if err := os.WriteFile(filepath.Join(dir,"data-usage-v9.json"),append(expected,'\n'),0644);err != nil{t.Fatal(err)}
+ t.Logf("old scanner/v9 writer: bytes=%d size=%d objects=%d versions=%d markers=%d hts=%d",buf.Len(),flat.Size,flat.Objects,flat.Versions,flat.DeleteMarkers,flat.HotTierSize)
+}

@@ -639,7 +639,14 @@ func (z *erasureServerPools) getPoolIdxNoLock(ctx context.Context, bucket, objec
 // if none are found falls back to most available space pool, this function is
 // designed to be only used by PutObject, CopyObject (newObject creation) and NewMultipartUpload.
 func (z *erasureServerPools) getPoolIdx(ctx context.Context, bucket, object string, size int64) (idx int, err error) {
+	return z.getWritePoolIdx(ctx, bucket, object, size, false)
+}
+
+// getWritePoolIdx keeps the write-allocation policy when the caller already
+// holds the pools-layer object lock and must not reacquire a set read lock.
+func (z *erasureServerPools) getWritePoolIdx(ctx context.Context, bucket, object string, size int64, noLock bool) (idx int, err error) {
 	pinfo, _, err := z.getPoolInfoExistingWithOpts(ctx, bucket, object, ObjectOptions{
+		NoLock:             noLock,
 		SkipDecommissioned: true,
 		SkipRebalancing:    true,
 	})
@@ -1135,7 +1142,52 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 		return z.serverPools[0].PutObject(ctx, bucket, object, data, opts)
 	}
 
-	idx, err := z.getPoolIdx(ctx, bucket, object, data.Size())
+	if !opts.NoLock {
+		lk := z.NewNSLock(bucket, object)
+		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		ctx = lkctx.Context()
+		defer lk.Unlock(lkctx)
+	}
+	opts.NoLock = true
+
+	// Public write conditions compare the logical current object while the
+	// pools-layer write lock is held. The destination selected by capacity may
+	// be empty or stale, and draining pools can still hold the current object.
+	// Replica callbacks retain their existing addressed-version semantics and
+	// metadata reconciliation at the set layer.
+	if opts.CheckPrecondFn != nil && !opts.ReplicationRequest &&
+		!opts.ReplicaLockReconcile && !opts.DataMovement {
+		copies, lerr := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{
+			VersionID:        "", // Compare the current object, not the write's version.
+			Versioned:        opts.Versioned,
+			VersionSuspended: opts.VersionSuspended,
+			NoAuditLog:       true,
+		})
+		var latest ObjectInfo
+		if lerr == nil {
+			latest = copies[0].ObjInfo
+			if latest.DeleteMarker {
+				lerr = toObjectErr(errFileNotFound, bucket, object)
+			}
+		}
+		// An unreadable pool may hold the newest object; it is not absence.
+		if lerr != nil && !isErrObjectNotFound(lerr) && !isErrVersionNotFound(lerr) {
+			return ObjectInfo{}, lerr
+		}
+		if lerr == nil && opts.CheckPrecondFn(latest) {
+			return ObjectInfo{}, PreConditionFailed{}
+		}
+		if lerr != nil && opts.HasIfMatch {
+			return ObjectInfo{}, lerr
+		}
+		// Do not repeat an accepted condition against the destination's copy.
+		opts.CheckPrecondFn = nil
+	}
+
+	idx, err := z.getWritePoolIdx(ctx, bucket, object, data.Size(), true)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -1149,7 +1201,15 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 		}
 	}
 
-	return z.serverPools[idx].PutObject(ctx, bucket, object, data, opts)
+	if opts.ReplicaLockReconcile || opts.DataMovement {
+		opts.ReplicaLockReconcile = true
+		opts.replicaObjectInfo = z.replicaObjectInfo
+	}
+	oi, err := z.serverPools[idx].PutObject(ctx, bucket, object, data, opts)
+	if err == nil && opts.ReplicaLockReconcile && !opts.DataMovement {
+		err = z.retireReplicaCopies(ctx, bucket, object, idx, oi)
+	}
+	return oi, err
 }
 
 func (z *erasureServerPools) deletePrefix(ctx context.Context, bucket string, prefix string) error {
@@ -1170,7 +1230,7 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		object = encodeDirObject(object)
 	}
 
-	// Acquire a write lock before deleting the object.
+	// Serialize logical deletion with pooled writes and metadata updates.
 	lk := z.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalDeleteOperationTimeout)
 	if err != nil {
@@ -1183,6 +1243,16 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		return ObjectInfo{}, z.deletePrefix(ctx, bucket, object)
 	}
 
+	// Resolve a physical purge by its addressed version even on a replica
+	// receiver: latest-key routing can select a different pool or miss copies.
+	// Marker creation and specialized movement/scanner operations retain their
+	// existing routing.
+	reconcileVersion := opts.VersionID != "" && !opts.DataMovement &&
+		(!opts.ReplicationRequest || opts.isVersionPurge()) && !opts.Expiration.Expire && !opts.InclFreeVersions
+	if !z.SinglePool() && (opts.CheckPrecondFn != nil || reconcileVersion) {
+		return z.deleteObjectReconciled(ctx, bucket, object, opts)
+	}
+
 	gopts := opts
 	gopts.NoLock = true
 
@@ -1191,7 +1261,65 @@ func (z *erasureServerPools) DeleteObject(ctx context.Context, bucket string, ob
 		if _, ok := err.(InsufficientReadQuorum); ok {
 			return objInfo, InsufficientWriteQuorum{}
 		}
+		// Lookup can return before the set's purge confirmation. Check here,
+		// before any callback can change the request into a metadata update.
+		if opts.isVersionPurge() && (isErrObjectNotFound(err) || isErrVersionNotFound(err)) {
+			if quorumErr := z.checkPurgeAbsent(ctx, bucket, object, opts.VersionID); quorumErr != nil {
+				return objInfo, quorumErr
+			}
+		}
+		// A conditional (If-Match) delete addressing a specific version treats an
+		// absent key as an absent version. getPoolInfoExistingWithOpts strips
+		// VersionID, so a missing key surfaces ObjectNotFound here even for a
+		// version-scoped delete; normalize it to VersionNotFound (NoSuchVersion),
+		// matching this function's tail. The unconditional path is unchanged.
+		if opts.CheckPrecondFn != nil && opts.VersionID != "" && isErrObjectNotFound(err) {
+			return objInfo, VersionNotFound{Bucket: bucket, Object: object, VersionID: opts.VersionID}
+		}
 		return objInfo, err
+	}
+
+	// Evaluate the conditional (If-Match) precondition while the write lock
+	// acquired above is held, before the delete-marker short-circuit and before
+	// any version is removed, so the object cannot change between the check and
+	// the delete. This is scoped to a single erasure set (see the note at the
+	// lock above): only there do the delete lock and the write path share the
+	// same lock namespace, making the check-then-delete atomic.
+	if opts.CheckPrecondFn != nil {
+		// pinfo.ObjInfo is the current latest version. getPoolInfoExistingWithOpts
+		// intentionally strips VersionID, so for a version-scoped delete read the
+		// specifically addressed version and evaluate the precondition against it.
+		checkInfo := pinfo.ObjInfo
+		if opts.VersionID != "" {
+			vopts := opts
+			vopts.NoLock = true // delete lock already held above
+			vopts.CheckPrecondFn = nil
+			vi, verr := z.serverPools[pinfo.Index].GetObjectInfo(ctx, bucket, object, vopts)
+			if verr != nil && (!isErrMethodNotAllowed(verr) || !vi.DeleteMarker) {
+				// Genuine read failure for the addressed version: a missing
+				// version -> VersionNotFound (NoSuchVersion), read-quorum loss, etc.
+				if opts.isVersionPurge() && (isErrObjectNotFound(verr) || isErrVersionNotFound(verr)) {
+					if quorumErr := z.checkPurgeAbsent(ctx, bucket, object, opts.VersionID); quorumErr != nil {
+						return objInfo, quorumErr
+					}
+				}
+				return objInfo, verr
+			}
+			// verr is nil for a live version, or MethodNotAllowed with a populated
+			// delete-marker ObjectInfo when the addressed version is a delete
+			// marker. In the latter case evaluate the precondition against the
+			// marker, which fails any If-Match (-> 412), rather than surfacing 405.
+			checkInfo = vi
+		} else if checkInfo.Name == "" {
+			// The current state could not be read (e.g. read-quorum loss); refuse
+			// the conditional delete rather than act on an unverified precondition.
+			return objInfo, InsufficientReadQuorum{}
+		}
+		if opts.CheckPrecondFn(checkInfo) {
+			return objInfo, PreConditionFailed{}
+		}
+		// Precondition satisfied; lower layers must not re-evaluate it.
+		opts.CheckPrecondFn = nil
 	}
 
 	// Delete marker already present we are not going to create new delete markers.
@@ -1272,8 +1400,12 @@ func (z *erasureServerPools) deleteObjectFromAllPools(ctx context.Context, bucke
 	// the delete call tries to clean up other pools during DeleteObject call.
 	objInfo = dobjects[0]
 	objInfo.Name = decodeDirObject(object)
-	err = derrs[0]
-	return objInfo, err
+	for _, derr := range derrs {
+		if derr != nil && !isErrObjectNotFound(derr) && !isErrVersionNotFound(derr) {
+			return objInfo, derr
+		}
+	}
+	return objInfo, derrs[0]
 }
 
 func (z *erasureServerPools) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
@@ -1361,9 +1493,36 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		dstOpts.NoLock = true
 	}
 
+	if !z.SinglePool() && cpSrcDstSame && srcInfo.metadataOnly && dstOpts.ReplicaLockReconcile && srcOpts.VersionID == dstOpts.VersionID {
+		copies, err := z.metadataPoolInfos(ctx, dstBucket, dstObject, dstOpts)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		stored := mergedPoolObjectInfo(copies)
+		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(stored.UserDefined))
+		reconcileStoredObjectTags(srcInfo.UserDefined, stored.UserTags, stored.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
+		idx := copies[0].Index
+		oi, err := z.serverPools[idx].CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
+		if err == nil {
+			err = z.retireReplicaCopies(ctx, dstBucket, dstObject, idx, oi)
+		}
+		return oi, err
+	}
+
 	poolIdx, err := z.getPoolIdxNoLock(ctx, dstBucket, dstObject, srcInfo.Size)
 	if err != nil {
 		return objInfo, err
+	}
+
+	if !z.SinglePool() && dstOpts.ReplicaLockReconcile {
+		dstOpts.replicaObjectInfo = z.replicaObjectInfo
+		if !dstOpts.DataMovement {
+			defer func() {
+				if err == nil {
+					err = z.retireReplicaCopies(ctx, dstBucket, dstObject, poolIdx, objInfo)
+				}
+			}()
+		}
 	}
 
 	// CopyObjectHandler predicts the outcome of this decision in
@@ -1400,6 +1559,8 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		EncryptFn:                  dstOpts.EncryptFn,
 		WantChecksum:               dstOpts.WantChecksum,
 		WantServerSideChecksumType: dstOpts.WantServerSideChecksumType,
+		ReplicaLockReconcile:       dstOpts.ReplicaLockReconcile,
+		replicaObjectInfo:          dstOpts.replicaObjectInfo,
 	}
 
 	return z.serverPools[poolIdx].PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)
@@ -1749,7 +1910,41 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 	if err := checkListMultipartArgs(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter); err != nil {
 		return ListMultipartsInfo{}, err
 	}
+	if _, err := z.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
+		return ListMultipartsInfo{}, toObjectErr(err, bucket)
+	}
+	if globalAPIConfig.getMultipartListingLegacy() {
+		return z.listMultipartUploadsLegacy(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+	}
+	scan, err := startMultipartScan(ctx, false)
+	if err != nil {
+		return ListMultipartsInfo{}, err
+	}
+	defer scan.close()
 
+	var uploads []MultipartInfo
+	var keyless bool
+	for idx, pool := range z.serverPools {
+		if z.IsSuspended(idx) {
+			continue
+		}
+		poolUploads, poolKeyless, err := pool.scanMultipartUploads(scan, bucket, idx)
+		if err != nil {
+			return ListMultipartsInfo{}, err
+		}
+		uploads = append(uploads, poolUploads...)
+		keyless = keyless || poolKeyless
+	}
+
+	// The old format cannot be enumerated authoritatively. Migration mode is
+	// explicit: another bucket must never silently change this API's semantics.
+	if keyless {
+		return ListMultipartsInfo{}, errMultipartListingLegacy
+	}
+	return paginateMultipartUploads(uploads, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads), nil
+}
+
+func (z *erasureServerPools) listMultipartUploadsLegacy(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (ListMultipartsInfo, error) {
 	poolResult := ListMultipartsInfo{}
 	poolResult.MaxUploads = maxUploads
 	poolResult.KeyMarker = keyMarker
@@ -1775,15 +1970,14 @@ func (z *erasureServerPools) ListMultipartUploads(ctx context.Context, bucket, p
 	}
 
 	if z.SinglePool() {
-		return z.serverPools[0].ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+		return z.serverPools[0].getHashedSet(prefix).listMultipartUploadsExact(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 	}
 
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
 		}
-		result, err := pool.ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker,
-			delimiter, maxUploads)
+		result, err := pool.getHashedSet(prefix).listMultipartUploadsExact(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 		if err != nil {
 			return result, err
 		}
@@ -1819,7 +2013,7 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 			continue
 		}
 
-		result, err := pool.ListMultipartUploads(ctx, bucket, object, "", "", "", maxUploadsList)
+		result, err := pool.listMultipartUploadsExact(ctx, bucket, object)
 		if err != nil {
 			return nil, err
 		}
@@ -1981,13 +2175,18 @@ func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, o
 	if err := checkAbortMultipartArgs(ctx, bucket, object, uploadID); err != nil {
 		return err
 	}
+	if _, err := z.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
+		return toObjectErr(err, bucket)
+	}
 
-	defer func() {
+	// Unlock cancels the derived lock context before this notification runs.
+	// Keep the request context so successful cancellation reaches peer caches.
+	defer func(ctx context.Context) {
 		if err == nil {
 			z.mpCache.Delete(uploadID)
 			globalNotificationSys.DeleteUploadID(ctx, uploadID)
 		}
-	}()
+	}(ctx)
 
 	lk := z.NewNSLock(bucket, pathJoin(object, uploadID))
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
@@ -1997,23 +2196,28 @@ func (z *erasureServerPools) AbortMultipartUpload(ctx context.Context, bucket, o
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx)
 
-	if z.SinglePool() {
-		return z.serverPools[0].AbortMultipartUpload(ctx, bucket, object, uploadID, opts)
-	}
-
+	legacy := globalAPIConfig.getMultipartListingLegacy()
+	found := false
+	var firstErr error
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
 		}
-		err := pool.AbortMultipartUpload(ctx, bucket, object, uploadID, opts)
-		if err == nil {
-			return nil
+		poolFound, err := pool.getHashedSet(object).abortMultipartUpload(ctx, bucket, object, uploadID, opts, legacy)
+		if legacy && (poolFound || err != nil) {
+			// Match the released first-matching-pool behavior.
+			return err
 		}
-		if _, ok := err.(InvalidUploadID); ok {
-			// upload id not found move to next pool
-			continue
+		found = found || poolFound
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
-		return err
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if found {
+		return nil
 	}
 	return InvalidUploadID{
 		Bucket:   bucket,
@@ -2035,6 +2239,60 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		}
 	}()
 
+	if !z.SinglePool() {
+		if !opts.NoLock {
+			lk := z.NewNSLock(bucket, encodeDirObject(object))
+			lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+			if err != nil {
+				return objInfo, err
+			}
+			ctx = lkctx.Context()
+			defer lk.Unlock(lkctx)
+		}
+		opts.NoLock = true
+
+		// A conditional completion must be evaluated against the logical
+		// latest object across pools, under the object write lock held for
+		// this operation. The pool hosting the upload may only hold a stale
+		// duplicate, so its set-local check would both accept an outdated
+		// ETag and reject the current one. An unreadable pool is not
+		// absence: it may hold the newest copy, so a read that cannot be
+		// verified fails the request instead of passing the condition.
+		// Once satisfied, the callback is cleared so the set layer does not
+		// re-evaluate it against its local copy.
+		if opts.CheckPrecondFn != nil {
+			copies, lerr := z.objectPoolInfos(ctx, bucket, encodeDirObject(object), ObjectOptions{
+				// Conditions always compare the logical current object,
+				// independently of the completion's destination version.
+				VersionID:        "",
+				Versioned:        opts.Versioned,
+				VersionSuspended: opts.VersionSuspended,
+				NoAuditLog:       true,
+			})
+			var latest ObjectInfo
+			if lerr == nil {
+				latest = copies[0].ObjInfo
+				if latest.DeleteMarker {
+					// A delete-marker latest reads as an absent key, matching
+					// the set layer's getObjectInfo.
+					lerr = toObjectErr(errFileNotFound, bucket, object)
+				}
+			}
+			if lerr == nil && opts.CheckPrecondFn(latest) {
+				return ObjectInfo{}, PreConditionFailed{}
+			}
+			if lerr != nil && !isErrVersionNotFound(lerr) && !isErrObjectNotFound(lerr) {
+				return ObjectInfo{}, lerr
+			}
+			// if object doesn't exist return error for If-Match conditional requests
+			// If-None-Match should be allowed to proceed for non-existent objects
+			if lerr != nil && opts.HasIfMatch && (isErrObjectNotFound(lerr) || isErrVersionNotFound(lerr)) {
+				return ObjectInfo{}, lerr
+			}
+			opts.CheckPrecondFn = nil
+		}
+	}
+
 	// Hold write locks to verify uploaded parts, also disallows any
 	// parallel PutObjectPart() requests.
 	uploadIDLock := z.NewNSLock(bucket, pathJoin(object, uploadID))
@@ -2049,13 +2307,21 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 		return z.serverPools[0].CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
 	}
 
+	if opts.ReplicaLockReconcile || opts.DataMovement {
+		opts.ReplicaLockReconcile = true
+		opts.replicaObjectInfo = z.replicaObjectInfo
+	}
+
 	for idx, pool := range z.serverPools {
 		if z.IsSuspended(idx) {
 			continue
 		}
 		objInfo, err = pool.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
 		if err == nil {
-			return objInfo, nil
+			if opts.ReplicaLockReconcile && !opts.DataMovement {
+				err = z.retireReplicaCopies(ctx, bucket, encodeDirObject(object), idx, objInfo)
+			}
+			return objInfo, err
 		}
 		if _, ok := err.(InvalidUploadID); ok {
 			// upload id not found move to next pool
@@ -2076,6 +2342,11 @@ func (z *erasureServerPools) GetBucketInfo(ctx context.Context, bucket string, o
 	bucketInfo, err = z.s3Peer.GetBucketInfo(ctx, bucket, opts)
 	if err != nil {
 		return bucketInfo, toObjectErr(err, bucket)
+	}
+	// Physical existence/creation probes must not be overwritten by cached
+	// metadata, which can legitimately lack Created on an unmigrated bucket.
+	if opts.NoMetadata {
+		return bucketInfo, nil
 	}
 
 	meta, err := globalBucketMetadataSys.Get(bucket)
@@ -2145,7 +2416,15 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, op
 		opts.Force = true
 	}
 
-	err := z.s3Peer.DeleteBucket(ctx, bucket, opts)
+	// Take the metadata writer lock before deleting anything. Failure or
+	// cancellation must leave both the bucket and its metadata intact.
+	ctx, unlock, err := lockBucketMetadata(ctx, z, bucket)
+	if err != nil {
+		return toObjectErr(err, bucket)
+	}
+	defer unlock()
+
+	err = z.s3Peer.DeleteBucket(ctx, bucket, opts)
 	if err == nil || isErrBucketNotFound(err) {
 		// If site replication is configured, hold on to deleted bucket state until sites sync
 		if opts.SRDeleteOp == MarkDelete {
@@ -2154,8 +2433,9 @@ func (z *erasureServerPools) DeleteBucket(ctx context.Context, bucket string, op
 	}
 
 	if err == nil {
-		// Purge the entire bucket metadata entirely.
-		z.deleteAll(context.Background(), minioMetaBucket, pathJoin(bucketMetaPrefix, bucket))
+		// Finish cleanup after a committed delete even if the client disconnects.
+		// Both the bucket-name and metadata locks remain held until return.
+		z.deleteAll(context.WithoutCancel(ctx), minioMetaBucket, pathJoin(bucketMetaPrefix, bucket))
 	}
 
 	return toObjectErr(err, bucket)
@@ -2573,7 +2853,7 @@ func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, ver
 		wg.Add(1)
 		go func(idx int, pool *erasureSets) {
 			defer wg.Done()
-			result, err := pool.HealObject(ctx, bucket, object, versionID, opts)
+			result, err := z.healObjectInPool(ctx, pool.getHashedSet(object), bucket, object, versionID, opts)
 			result.Object = decodeDirObject(result.Object)
 			errs[idx] = err
 			results[idx] = result
@@ -2842,15 +3122,7 @@ func (z *erasureServerPools) PutObjectMetadata(ctx context.Context, bucket, obje
 		defer lk.Unlock(lkctx)
 	}
 
-	opts.MetadataChg = true
-	opts.NoLock = true
-	// We don't know the size here set 1GiB at least.
-	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-
-	return z.serverPools[idx].PutObjectMetadata(ctx, bucket, object, opts)
+	return z.updatePoolMetadata(ctx, bucket, object, opts)
 }
 
 // PutObjectTags - replace or add tags to an existing object
@@ -2871,44 +3143,40 @@ func (z *erasureServerPools) PutObjectTags(ctx context.Context, bucket, object s
 		defer lk.Unlock(lkctx)
 	}
 
-	opts.MetadataChg = true
-	opts.NoLock = true
-
-	// We don't know the size here set 1GiB at least.
-	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
+	copies, err := z.metadataPoolInfos(ctx, bucket, object, opts)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-
-	return z.serverPools[idx].PutObjectTags(ctx, bucket, object, tags, opts)
+	// Ordinary reads and replication can return any owning pool. Persist one
+	// revision beyond all copies, so the returned value and every pool agree.
+	if stamp := opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]; stamp != "" {
+		for _, copy := range copies {
+			stamp = monotonicTaggingTimestamp(stamp, copy.ObjInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
+		}
+		opts.UserDefined = cloneMSS(opts.UserDefined)
+		opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp] = stamp
+	}
+	opts.NoLock = true
+	opts.VersionID = copies[0].ObjInfo.VersionID
+	if opts.VersionID == "" {
+		opts.VersionID = nullVersionID
+	}
+	var primary ObjectInfo
+	for _, copy := range copies {
+		oi, err := z.serverPools[copy.Index].PutObjectTags(ctx, bucket, object, tags, opts)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		if copy.Index == copies[0].Index {
+			primary = oi
+		}
+	}
+	return primary, nil
 }
 
 // DeleteObjectTags - delete object tags from an existing object
 func (z *erasureServerPools) DeleteObjectTags(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
-	object = encodeDirObject(object)
-	if z.SinglePool() {
-		return z.serverPools[0].DeleteObjectTags(ctx, bucket, object, opts)
-	}
-
-	if !opts.NoLock {
-		// Lock the object before deleting tags.
-		lk := z.NewNSLock(bucket, object)
-		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			return ObjectInfo{}, err
-		}
-		ctx = lkctx.Context()
-		defer lk.Unlock(lkctx)
-	}
-
-	opts.MetadataChg = true
-	opts.NoLock = true
-	idx, err := z.getPoolIdxExistingWithOpts(ctx, bucket, object, opts)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-
-	return z.serverPools[idx].DeleteObjectTags(ctx, bucket, object, opts)
+	return z.PutObjectTags(ctx, bucket, object, "", opts)
 }
 
 // GetObjectTags - get object tags from an existing object
@@ -2918,7 +3186,7 @@ func (z *erasureServerPools) GetObjectTags(ctx context.Context, bucket, object s
 		return z.serverPools[0].GetObjectTags(ctx, bucket, object, opts)
 	}
 
-	oi, _, err := z.getLatestObjectInfoWithIdx(ctx, bucket, object, opts)
+	oi, err := z.GetObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
 		return nil, err
 	}

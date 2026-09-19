@@ -163,6 +163,7 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 
 		// StorageInfo operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/storageinfo").HandlerFunc(adminMiddleware(adminAPI.StorageInfoHandler, traceAllFlag))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/multipart-preflight").HandlerFunc(adminMiddleware(adminAPI.MultipartPreflightHandler, traceAllFlag))
 		// DataUsageInfo operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/datausageinfo").HandlerFunc(adminMiddleware(adminAPI.DataUsageInfoHandler, traceAllFlag))
 		// Metrics operation
@@ -388,6 +389,7 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/join").HandlerFunc(adminMiddleware(adminAPI.SRPeerJoin))
 		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/site-replication/peer/bucket-ops").HandlerFunc(adminMiddleware(adminAPI.SRPeerBucketOps)).Queries("bucket", "{bucket:.*}").Queries("operation", "{operation:.*}")
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/iam-item").HandlerFunc(adminMiddleware(adminAPI.SRPeerReplicateIAMItem))
+		adminRouter.Methods(http.MethodGet, http.MethodPut).Path(adminVersion + "/site-replication/peer/iam-revisions").HandlerFunc(adminMiddleware(adminAPI.SRPeerIAMRevisions))
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/peer/bucket-meta").HandlerFunc(adminMiddleware(adminAPI.SRPeerReplicateBucketItem))
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/site-replication/peer/idp-settings").HandlerFunc(adminMiddleware(adminAPI.SRPeerGetIDPSettings))
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/edit").HandlerFunc(adminMiddleware(adminAPI.SiteReplicationEdit))

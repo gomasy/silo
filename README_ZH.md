@@ -35,6 +35,13 @@
 > [!NOTE]
 > 2026-08-06，本仓库由 `pgsty/minio` 更名为 `pgsty/silo`，默认分支由 `master` 更名为 `main`。以原 MinIO 形态维持的归档构件仍位于归档的 [`minio`](https://github.com/pgsty/silo/tree/minio) 分支，以及截止 [`RELEASE.2026-08-04T00-00-00Z`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z) 的历次发布中。
 
+## 当前发行版与主分支
+
+最新已发布的 Server 仍为 [20260903](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-09-03T13-18-01Z)。
+截至 2026-09-16，主分支已合入更新的安全、存储、Console 与共享包改动，但尚未发布新 Server。
+准确的已发布/源码边界见 [CHANGELOG.md](CHANGELOG.md) 与[组件版本矩阵](https://silo.pgsty.com/zh/compatibility/versions/)，
+其中包括 SN-2026-011 修复状态与密码权限迁移要求。
+
 ## 概述
 
 上游停止社区发行后，Silo 为开源 MinIO 服务端维护一条持续可用的版本线：构建、软件包、多架构镜像、安全修复与完整 Web 控制台。Pigsty 在生产环境中用它承载 PostgreSQL 备份存储。
@@ -85,9 +92,24 @@ docker exec silo mcli mb local/demo && docker exec silo mcli ls local
 
 ## 兼容性
 
-S3 API、`MINIO_*` 环境变量、`minio_*` 指标、`x-minio-*` 头、`/minio/*` 路由、`github.com/minio/*` 导入路径与磁盘格式（含 `.minio.sys`）原样保留，并由 CI 兼容性门禁冻结。只有 Silo 自有交付面改名：`silo` 可执行文件、软件包、服务、Helm Chart 与容器镜像 —— 原生交付物不会安装 `minio` 二进制别名。
+Silo 保留 S3 与存储格式兼容性，包括既有 `MINIO_*` 环境变量、`minio_*` 指标、`x-minio-*` 头、`/minio/*` 路由与 `.minio.sys` 数据。CI 守卫检查选定的兼容性标识，有意的安全与行为变化在发布说明中记录。Silo 自有交付面使用 `silo` 可执行文件、软件包、服务、Helm Chart 与容器镜像；原生交付物不会安装 `minio` 服务端二进制别名。
+
+正式支持和发布验收的组合为 `pgsty/silo` + `pgsty/silo-console` + `pgsty/mc` + `pgsty/silo-pkg`，对未修改的上游 MinIO/MC 尽最大努力保持兼容。Server、Console 与客户端按需保留历史模块路径，维护源码直接导入 `github.com/pgsty/silo-pkg/v3`；SDK `github.com/minio/minio-go/v7` 是明确保留的上游依赖。具体版本与 replace 以当前 [go.mod](go.mod) 为准。
 
 与上游的全部分歧，以逐项核验代码的[兼容性审计](https://silo.pgsty.com/zh/compatibility/server/)形式维护。每个版本仍应视为下游升级：锁定版本，阅读[版本说明](https://silo.pgsty.com/zh/tags/silo/)，并保留回滚路径。
+
+### TLS 与 Go 升级
+
+Server 恢复 Go 默认密钥交换策略的修复已在 main，尚未包含在 Server 20260903。
+`GODEBUG=tlsmlkem=0`、`tlssecpmlkem=0` 的适用范围、macOS 根证书来源变化，
+以及 OIDC discovery 的诊断方法见 [Go 1.27 TLS 与 OIDC 指南](https://silo.pgsty.com/zh/blog/design/go127-tls-oidc-discovery/)。
+
+## 文档归属
+
+用户文档统一维护在 [silo.pgsty.com](https://silo.pgsty.com/zh/docs/)，源码位于
+[pgsty/silo.pgsty.com](https://github.com/pgsty/silo.pgsty.com)。本仓库保留的 `docs/`
+主要是继承的参考材料、示例和工具测试夹具。调查日志、AI 工作记录与临时报告放在仓库外；
+可复用的结论应整理进伴生文档站。仓库职责与维护规则见 [AGENTS.md](AGENTS.md)。
 
 ## 安全与贡献
 
@@ -95,53 +117,25 @@ S3 API、`MINIO_*` 环境变量、`minio_*` 指标、`x-minio-*` 头、`/minio/*
 
 ## 贡献者
 
-<table>
-  <tr>
-    <td align="center" width="150">
-      <a href="https://github.com/ZouhairCharef"><img src="https://github.com/ZouhairCharef.png?size=100" width="72" alt="ZouhairCharef"><br><sub><b>@ZouhairCharef</b></sub></a><br><sub>CVE-2026-34986</sub>
-    </td>
-    <td align="center" width="150">
-      <a href="https://github.com/mfredenhagen"><img src="https://github.com/mfredenhagen.png?size=100" width="72" alt="mfredenhagen"><br><sub><b>@mfredenhagen</b></sub></a><br><sub>CVE-2026-39883</sub>
-    </td>
-    <td align="center" width="150">
-      <a href="https://github.com/pinginfo"><img src="https://github.com/pinginfo.png?size=100" width="72" alt="pinginfo"><br><sub><b>@pinginfo</b></sub></a><br><sub>桶通知流式输出</sub>
-    </td>
-    <td align="center" width="150">
-      <a href="https://github.com/waterkip"><img src="https://github.com/waterkip.png?size=100" width="72" alt="waterkip"><br><sub><b>@waterkip</b></sub></a><br><sub>文档链接修正</sub>
-    </td>
-  </tr>
-</table>
-<p>
-<a href="https://github.com/magicxor"><img src="https://github.com/magicxor.png?size=64" width="44" alt="magicxor" title="@magicxor"></a>
-<a href="https://github.com/ycjlin"><img src="https://github.com/ycjlin.png?size=64" width="44" alt="ycjlin" title="@ycjlin"></a>
-<a href="https://github.com/h5vx"><img src="https://github.com/h5vx.png?size=64" width="44" alt="h5vx" title="@h5vx"></a>
-<a href="https://github.com/Dansyuqri"><img src="https://github.com/Dansyuqri.png?size=64" width="44" alt="Dansyuqri" title="@Dansyuqri"></a>
-<a href="https://github.com/davinkevin"><img src="https://github.com/davinkevin.png?size=64" width="44" alt="davinkevin" title="@davinkevin"></a>
-<a href="https://github.com/lem21h"><img src="https://github.com/lem21h.png?size=64" width="44" alt="lem21h" title="@lem21h"></a>
-<a href="https://github.com/sulin37392"><img src="https://github.com/sulin37392.png?size=64" width="44" alt="sulin37392" title="@sulin37392"></a>
-<a href="https://github.com/mosesdd"><img src="https://github.com/mosesdd.png?size=64" width="44" alt="mosesdd" title="@mosesdd"></a>
-<a href="https://github.com/Xavier-777"><img src="https://github.com/Xavier-777.png?size=64" width="44" alt="Xavier-777" title="@Xavier-777"></a>
-<a href="https://github.com/jiadzh"><img src="https://github.com/jiadzh.png?size=64" width="44" alt="jiadzh" title="@jiadzh"></a>
-<a href="https://github.com/TLINDEN"><img src="https://github.com/TLINDEN.png?size=64" width="44" alt="TLINDEN" title="@TLINDEN"></a>
-<a href="https://github.com/AntonOfTheWoods"><img src="https://github.com/AntonOfTheWoods.png?size=64" width="44" alt="AntonOfTheWoods" title="@AntonOfTheWoods"></a>
-<a href="https://github.com/zylpsrs"><img src="https://github.com/zylpsrs.png?size=64" width="44" alt="zylpsrs" title="@zylpsrs"></a>
-<a href="https://github.com/nsanitate"><img src="https://github.com/nsanitate.png?size=64" width="44" alt="nsanitate" title="@nsanitate"></a>
-<a href="https://github.com/makinikm"><img src="https://github.com/makinikm.png?size=64" width="44" alt="makinikm" title="@makinikm"></a>
-<a href="https://github.com/spaceg00se-r"><img src="https://github.com/spaceg00se-r.png?size=64" width="44" alt="spaceg00se-r" title="@spaceg00se-r"></a>
-<a href="https://github.com/heroes1412"><img src="https://github.com/heroes1412.png?size=64" width="44" alt="heroes1412" title="@heroes1412"></a>
-<a href="https://github.com/vampywiz17"><img src="https://github.com/vampywiz17.png?size=64" width="44" alt="vampywiz17" title="@vampywiz17"></a>
-<a href="https://github.com/chalukyaj"><img src="https://github.com/chalukyaj.png?size=64" width="44" alt="chalukyaj" title="@chalukyaj"></a>
-<a href="https://github.com/cbornet"><img src="https://github.com/cbornet.png?size=64" width="44" alt="cbornet" title="@cbornet"></a>
-<a href="https://github.com/jvasile"><img src="https://github.com/jvasile.png?size=64" width="44" alt="jvasile" title="@jvasile"></a>
-<a href="https://github.com/Kesavaambati"><img src="https://github.com/Kesavaambati.png?size=64" width="44" alt="Kesavaambati" title="@Kesavaambati"></a>
-<a href="https://github.com/redfoxfox"><img src="https://github.com/redfoxfox.png?size=64" width="44" alt="redfoxfox" title="@redfoxfox"></a>
-<a href="https://github.com/kuldeep-link11"><img src="https://github.com/kuldeep-link11.png?size=64" width="44" alt="kuldeep-link11" title="@kuldeep-link11"></a>
-<a href="https://github.com/meesudzu"><img src="https://github.com/meesudzu.png?size=64" width="44" alt="meesudzu" title="@meesudzu"></a>
-<a href="https://github.com/pmezhuev"><img src="https://github.com/pmezhuev.png?size=64" width="44" alt="pmezhuev" title="@pmezhuev"></a>
-<a href="https://github.com/kh0mka"><img src="https://github.com/kh0mka.png?size=64" width="44" alt="kh0mka" title="@kh0mka"></a>
-</p>
+<!-- Generated by silo.pgsty.com/bin/contributors.py. -->
 
-GitHub 不为 fork 仓库生成贡献者图表，因此 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)（而非 Insights 页面）才是本项目的署名记录，其中逐一记录了每个人对应的改动或报告。
+每位 issue 或 PR 的作者都是 SILO 社区的一员，包括尚未合并的工作。已合并的修复、被采纳的方案和有效报告优先展示，其余参考首次参与时间；金色圆环突出经过审核的显著贡献。
+
+<a href="CONTRIBUTORS.md">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/pgsty/silo/codex/repository-cards/contributors-dark.svg">
+  <img src="https://raw.githubusercontent.com/pgsty/silo/codex/repository-cards/contributors-light.svg" alt="SILO 社区贡献者">
+</picture>
+</a>
+
+[查看贡献记录与实际 PR 状态](CONTRIBUTORS.md)。
+
+## Star History
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/pgsty/silo/codex/repository-cards/star-history-dark.svg">
+  <img src="https://raw.githubusercontent.com/pgsty/silo/codex/repository-cards/star-history-light.svg" alt="SILO GitHub 星标历史">
+</picture>
 
 ## 背景
 

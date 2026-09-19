@@ -41,7 +41,7 @@ import (
 const (
 	maxObjectList  = 1000  // Limit number of objects in a listObjectsResponse/listObjectsVersionsResponse.
 	maxDeleteList  = 1000  // Limit number of objects deleted in a delete call.
-	maxUploadsList = 10000 // Limit number of uploads in a listUploadsResponse.
+	maxUploadsList = 1000  // Limit number of uploads in a listUploadsResponse.
 	maxPartsList   = 10000 // Limit number of parts in a listPartsResponse.
 )
 

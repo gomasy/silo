@@ -20,6 +20,7 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"runtime"
 	"strings"
 
@@ -83,7 +84,8 @@ func checkListMultipartArgs(ctx context.Context, bucket, prefix, keyMarker, uplo
 	if err := checkListObjsArgs(ctx, bucket, prefix, keyMarker); err != nil {
 		return err
 	}
-	if uploadIDMarker != "" {
+	// S3 ignores upload-id-marker when key-marker is absent.
+	if uploadIDMarker != "" && keyMarker != "" {
 		if HasSuffix(keyMarker, SlashSeparator) {
 			return InvalidUploadIDKeyCombination{
 				UploadIDMarker: uploadIDMarker,
@@ -95,6 +97,9 @@ func checkListMultipartArgs(ctx context.Context, bucket, prefix, keyMarker, uplo
 			return MalformedUploadID{
 				UploadID: uploadIDMarker,
 			}
+		}
+		if _, ok := multipartMarkerTime(uploadIDMarker); !ok {
+			return InvalidArgument{Bucket: bucket, Object: keyMarker, Err: errors.New("upload-id-marker must contain a native multipart upload ID")}
 		}
 	}
 	return nil

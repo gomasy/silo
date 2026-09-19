@@ -608,13 +608,12 @@ func GetDefaultConnSettings() xhttp.ConnSettings {
 // connections.
 func NewInternodeHTTPTransport(maxIdleConnsPerHost int) func() http.RoundTripper {
 	return xhttp.ConnSettings{
-		LookupHost:       globalDNSCache.LookupHost,
-		DialTimeout:      rest.DefaultTimeout,
-		RootCAs:          globalRootCAs,
-		CipherSuites:     crypto.TLSCiphers(),
-		CurvePreferences: crypto.TLSCurveIDs(),
-		EnableHTTP2:      false,
-		TCPOptions:       globalTCPOptions,
+		LookupHost:   globalDNSCache.LookupHost,
+		DialTimeout:  rest.DefaultTimeout,
+		RootCAs:      globalRootCAs,
+		CipherSuites: crypto.TLSCiphers(),
+		EnableHTTP2:  false,
+		TCPOptions:   globalTCPOptions,
 	}.NewInternodeHTTPTransport(maxIdleConnsPerHost)
 }
 
@@ -622,13 +621,12 @@ func NewInternodeHTTPTransport(maxIdleConnsPerHost int) func() http.RoundTripper
 // used while communicating with the cloud backends.
 func NewHTTPTransportWithClientCerts(clientCert, clientKey string) http.RoundTripper {
 	s := xhttp.ConnSettings{
-		LookupHost:       globalDNSCache.LookupHost,
-		DialTimeout:      defaultDialTimeout,
-		RootCAs:          globalRootCAs,
-		CipherSuites:     crypto.TLSCiphersBackwardCompatible(),
-		CurvePreferences: crypto.TLSCurveIDs(),
-		TCPOptions:       globalTCPOptions,
-		EnableHTTP2:      false,
+		LookupHost:   globalDNSCache.LookupHost,
+		DialTimeout:  defaultDialTimeout,
+		RootCAs:      globalRootCAs,
+		CipherSuites: crypto.TLSCiphersBackwardCompatible(),
+		TCPOptions:   globalTCPOptions,
+		EnableHTTP2:  false,
 	}
 
 	if clientCert != "" && clientKey != "" {
@@ -656,13 +654,12 @@ const defaultDialTimeout = 5 * time.Second
 // NewHTTPTransportWithTimeout allows setting a timeout.
 func NewHTTPTransportWithTimeout(timeout time.Duration) *http.Transport {
 	return xhttp.ConnSettings{
-		LookupHost:       globalDNSCache.LookupHost,
-		DialTimeout:      defaultDialTimeout,
-		RootCAs:          globalRootCAs,
-		TCPOptions:       globalTCPOptions,
-		CipherSuites:     crypto.TLSCiphersBackwardCompatible(),
-		CurvePreferences: crypto.TLSCurveIDs(),
-		EnableHTTP2:      false,
+		LookupHost:   globalDNSCache.LookupHost,
+		DialTimeout:  defaultDialTimeout,
+		RootCAs:      globalRootCAs,
+		TCPOptions:   globalTCPOptions,
+		CipherSuites: crypto.TLSCiphersBackwardCompatible(),
+		EnableHTTP2:  false,
 	}.NewHTTPTransportWithTimeout(timeout)
 }
 
@@ -670,12 +667,11 @@ func NewHTTPTransportWithTimeout(timeout time.Duration) *http.Transport {
 // used while communicating with the remote replication targets.
 func NewRemoteTargetHTTPTransport(insecure bool) func() *http.Transport {
 	return xhttp.ConnSettings{
-		LookupHost:       globalDNSCache.LookupHost,
-		RootCAs:          globalRootCAs,
-		CipherSuites:     crypto.TLSCiphersBackwardCompatible(),
-		CurvePreferences: crypto.TLSCurveIDs(),
-		TCPOptions:       globalTCPOptions,
-		EnableHTTP2:      false,
+		LookupHost:   globalDNSCache.LookupHost,
+		RootCAs:      globalRootCAs,
+		CipherSuites: crypto.TLSCiphersBackwardCompatible(),
+		TCPOptions:   globalTCPOptions,
+		EnableHTTP2:  false,
 	}.NewRemoteTargetHTTPTransport(insecure)
 }
 
@@ -982,7 +978,6 @@ func newTLSConfig(getCert certs.GetCertificateFunc) *tls.Config {
 	} else {
 		tlsConfig.CipherSuites = crypto.TLSCiphersBackwardCompatible()
 	}
-	tlsConfig.CurvePreferences = crypto.TLSCurveIDs()
 	return tlsConfig
 }
 

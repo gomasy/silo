@@ -7,6 +7,14 @@ assignees: ''
 
 ---
 
+Report bugs in the PGSTY SILO server (`pgsty/silo`) here. Community maintainers
+handle reports on a best-effort basis. There is no SLA, SLO, or emergency
+production-support channel. Follow the
+[Code of Conduct](https://github.com/pgsty/silo/blob/main/code_of_conduct.md).
+Report suspected vulnerabilities privately through
+[SECURITY.md](https://github.com/pgsty/silo/blob/main/SECURITY.md).
+For patches, see the [contribution guide](https://github.com/pgsty/silo/blob/main/CONTRIBUTING.md).
+
 <!--- Provide a general summary of the issue in the Title above -->
 
 ## Expected Behavior

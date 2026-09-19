@@ -23,8 +23,10 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/handlers"
@@ -579,8 +581,20 @@ func TestGetConditionValuesRejectsAbsentInternalKeys(t *testing.T) {
 	}
 }
 
+// s3:signatureAge is derived from the presigned X-Amz-Date, which the signature
+// binds. A client header under the former scratch name must never supply it on
+// any auth type, and a presign whose date is missing or malformed leaves the
+// key absent (the verifier then rejects the request).
 func TestGetConditionValuesOnlyAcceptsPresignedSignatureAge(t *testing.T) {
 	const signatureAgeHeader = "x-amz-signature-age"
+	signedDate := UTCNow().Add(-90 * time.Second)
+	presignQuery := func(date string) string {
+		q := url.Values{xhttp.AmzCredential: {"access/20260803/us-east-1/s3/aws4_request"}}
+		if date != "" {
+			q.Set(xhttp.AmzDate, date)
+		}
+		return "http://minio.local/bkt/obj?" + q.Encode()
+	}
 
 	for _, tc := range []struct {
 		name    string
@@ -602,19 +616,33 @@ func TestGetConditionValuesOnlyAcceptsPresignedSignatureAge(t *testing.T) {
 			},
 		},
 		{
-			name: "presigned verifier value",
-			target: "http://minio.local/bkt/obj?" + url.Values{
-				xhttp.AmzCredential: {"access/20260803/us-east-1/s3/aws4_request"},
-			}.Encode(),
+			name:    "presigned client header without date",
+			target:  presignQuery(""),
+			headers: map[string]string{signatureAgeHeader: "250"},
+		},
+		{
+			name:   "presigned malformed date",
+			target: presignQuery("yesterday"),
+		},
+		{
+			name:    "presigned signed date",
+			target:  presignQuery(signedDate.Format(iso8601Format)),
 			headers: map[string]string{signatureAgeHeader: "250"},
 			want:    true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := condValuesForRequest(t, tc.target, tc.headers)
-			_, ok := got["signatureAge"]
+			v, ok := got["signatureAge"]
 			if ok != tc.want {
-				t.Fatalf("signatureAge presence: expected %v, got %v", tc.want, got["signatureAge"])
+				t.Fatalf("signatureAge presence: expected %v, got %v", tc.want, v)
+			}
+			if !tc.want {
+				return
+			}
+			age, err := strconv.ParseInt(strings.Join(v, ""), 10, 64)
+			if err != nil || age < (90*time.Second).Milliseconds() || age > (2*time.Minute).Milliseconds() {
+				t.Fatalf("signatureAge = %v, want about 90s derived from X-Amz-Date rather than the client header", v)
 			}
 		})
 	}

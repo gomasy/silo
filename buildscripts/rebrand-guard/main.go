@@ -115,6 +115,7 @@ func collect(repo string) (manifest, error) {
 	fset := token.NewFileSet()
 
 	for _, rel := range files {
+		// Migration notes and guard fixtures contain archived identifiers.
 		if rel == "SILO_REBRANDING_MIGRATION.md" ||
 			strings.HasPrefix(rel, "buildscripts/rebrand-guard/") ||
 			strings.HasPrefix(rel, "buildscripts/helm-migration-guard/") {

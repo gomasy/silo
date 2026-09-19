@@ -39,3 +39,28 @@ func TestBucketMetadataCorsRoundTrip(t *testing.T) {
 		t.Fatalf("CorsConfigUpdatedAt not preserved")
 	}
 }
+
+// A persisted retired extension must not prevent the whole bucket's metadata
+// from loading, including unrelated versioning and ordinary lifecycle rules.
+func TestBucketMetadataRetiredAccessTiering(t *testing.T) {
+	meta := newBucketMetadata("retired-access")
+	meta.LifecycleConfigXML = []byte(`<LifecycleConfiguration><AccessTierQuota>500GiB</AccessTierQuota><Rule><ID>access</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><AccessTransition><Window>10m</Window><PromoteAfterAccesses>10</PromoteAfterAccesses></AccessTransition></Rule><Rule><ID>ordinary</ID><Status>Enabled</Status><Filter><Prefix>expired/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>`)
+	meta.VersioningConfigXML = []byte(`<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>`)
+	data, err := meta.MarshalMsg(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := newBucketMetadata(meta.Name)
+	if _, err := got.UnmarshalMsg(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := got.parseAllConfigs(t.Context(), nil); err != nil {
+		t.Fatalf("bucket metadata failed to load: %v", err)
+	}
+	if got.lifecycleConfig == nil || got.lifecycleConfig.HasActiveRules("logs/") || !got.lifecycleConfig.HasActiveRules("expired/") {
+		t.Fatal("unexpected lifecycle behavior")
+	}
+	if got.versioningConfig == nil || !got.versioningConfig.Enabled() {
+		t.Fatal("unrelated versioning lost")
+	}
+}

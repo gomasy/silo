@@ -34,7 +34,7 @@ unset MINIO_KMS_KES_KEY_NAME
 export MINIO_CI_CD=1
 export MINIO_BROWSER=off
 export MINIO_ROOT_USER="minio"
-export MINIO_ROOT_PASSWORD="silo123"
+export MINIO_ROOT_PASSWORD="silo12345"
 export MINIO_KMS_AUTO_ENCRYPTION=off
 export MINIO_PROMETHEUS_AUTH_TYPE=public
 export MINIO_KMS_SECRET_KEY=my-minio-key:OSMM+vkKUTCvQs9YL/CVMIMt43HFhkUpqJxTmGl6rYw=
@@ -58,9 +58,9 @@ site2_pid=$!
 silo server --config-dir /tmp/silo-ldap --address ":9003" /tmp/silo-ldap-idp3/{1...4} >/tmp/silo3_1.log 2>&1 &
 site3_pid=$!
 
-export MC_HOST_silo1=http://minio:silo123@localhost:9001
-export MC_HOST_silo2=http://minio:silo123@localhost:9002
-export MC_HOST_silo3=http://minio:silo123@localhost:9003
+export MC_HOST_silo1=http://minio:silo12345@localhost:9001
+export MC_HOST_silo2=http://minio:silo12345@localhost:9002
+export MC_HOST_silo3=http://minio:silo12345@localhost:9003
 
 ./mc ready silo1
 ./mc ready silo2

@@ -229,10 +229,11 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 		return errCode
 	}
 
-	// Check if the metadata headers are equal with signedheaders
-	errMetaCode := checkMetaHeaders(extractedSignedHeaders, r)
-	if errMetaCode != ErrNone {
-		return errMetaCode
+	// Reject any x-amz-* header that the client did not sign. Without this an
+	// unsigned header (e.g. x-amz-copy-source) could alter the request that the
+	// presigned URL actually authorized.
+	if errUnsigned := checkUnsignedHeaders(extractedSignedHeaders, r); errUnsigned != ErrNone {
+		return errUnsigned
 	}
 
 	// If the host which signed the request is slightly ahead in time (by less than globalMaxSkewTime) the
@@ -335,8 +336,6 @@ func doesPresignedSignatureMatch(hashedPayload string, r *http.Request, region s
 		return ErrSignatureDoesNotMatch
 	}
 
-	r.Header.Set("x-amz-signature-age", strconv.FormatInt(UTCNow().Sub(pSignValues.Date).Milliseconds(), 10))
-
 	return ErrNone
 }
 
@@ -361,6 +360,14 @@ func doesSignatureMatch(hashedPayload string, r *http.Request, region string, st
 	extractedSignedHeaders, errCode := extractSignedHeaders(signV4Values.SignedHeaders, r)
 	if errCode != ErrNone {
 		return errCode
+	}
+
+	// Reject any x-amz-* header that the client did not sign. The Authorization
+	// header path shares extractSignedHeaders with the presigned path but, prior
+	// to this, never inspected the headers that actually arrived, so an unsigned
+	// x-amz-copy-source could redirect a signed PUT into a server-side copy.
+	if errUnsigned := checkUnsignedHeaders(extractedSignedHeaders, r); errUnsigned != ErrNone {
+		return errUnsigned
 	}
 
 	cred, _, s3Err := checkKeyValid(r, signV4Values.Credential.accessKey)

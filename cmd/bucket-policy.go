@@ -255,13 +255,32 @@ func getConditionValuesWithTags(r *http.Request, lc string, cred auth.Credential
 	}
 
 	cloneHeader := r.Header.Clone()
-	signatureAge := cloneHeader.Get("x-amz-signature-age")
-	cloneHeader.Del("x-amz-signature-age")
-	// The presigned V4 verifier overwrites this internal scratch header after
-	// validating the signature. Ignore a value supplied on every other request
-	// type, where it would otherwise synthesize s3:signatureAge.
-	if authType == authTypePresigned && signatureAge != "" {
-		args["signatureAge"] = []string{signatureAge}
+
+	// s3:signatureAge is derived from the presigned X-Amz-Date rather than from
+	// anything the verifier writes back: PutObject and UploadPart authorize
+	// before they verify the signature, so a post-verification value is not yet
+	// available on the first evaluation. The date is bound by the signature
+	// (doesPresignedSignatureMatch rebuilds and compares it), so a forged date
+	// only changes the authorization outcome of a request that then fails
+	// verification. A date that does not parse leaves the key absent; the
+	// verifier rejects the request as ErrMalformedPresignedDate.
+	if authType == authTypePresigned {
+		if signedDate, err := time.Parse(iso8601Format, r.Form.Get(xhttp.AmzDate)); err == nil {
+			args["signatureAge"] = []string{strconv.FormatInt(currTime.Sub(signedDate).Milliseconds(), 10)}
+		}
+	}
+
+	// s3:x-amz-content-sha256 must name the payload hash the request is actually
+	// verified and enforced against, and only one such value. Presence of the
+	// header controls whether the key exists at all (AWS documents that the
+	// query-string form does not populate it), but the value comes from the same
+	// selection getContentSha256Cksum makes for verification: the presigned query
+	// value takes precedence over the header, and a repeated header contributes
+	// only its first value. Exposing every raw header value instead let a
+	// request satisfy a policy with a value the verifier never checked.
+	if _, ok := cloneHeader[xhttp.AmzContentSha256]; ok {
+		args[xhttp.AmzContentSha256] = []string{getContentSha256Cksum(r, serviceS3)}
+		cloneHeader.Del(xhttp.AmzContentSha256)
 	}
 
 	userTags := cloneHeader.Get(xhttp.AmzObjectTagging)

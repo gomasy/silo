@@ -363,8 +363,8 @@ func TestGetContentSha256Cksum(t *testing.T) {
 	}
 }
 
-// Test TestCheckMetaHeaders tests the logic of checkMetaHeaders() function
-func TestCheckMetaHeaders(t *testing.T) {
+// Test TestCheckUnsignedHeaders tests the logic of checkUnsignedHeaders() function
+func TestCheckUnsignedHeaders(t *testing.T) {
 	signedHeadersMap := map[string][]string{
 		"X-Amz-Meta-Test":      {"test"},
 		"X-Amz-Meta-Extension": {"png"},
@@ -384,7 +384,7 @@ func TestCheckMetaHeaders(t *testing.T) {
 	inputHeader.Set("X-Amz-Meta-Extension", expectedMetaExtension)
 	inputHeader.Set("X-Amz-Meta-Name", expectedMetaName)
 	// calling the function being tested.
-	errCode := checkMetaHeaders(signedHeadersMap, r)
+	errCode := checkUnsignedHeaders(signedHeadersMap, r)
 	if errCode != ErrNone {
 		t.Fatalf("Expected the APIErrorCode to be %d, but got %d", ErrNone, errCode)
 	}
@@ -392,7 +392,7 @@ func TestCheckMetaHeaders(t *testing.T) {
 	// Add new metadata in inputHeader
 	inputHeader.Set("X-Amz-Meta-Clone", "fail")
 	// calling the function being tested.
-	errCode = checkMetaHeaders(signedHeadersMap, r)
+	errCode = checkUnsignedHeaders(signedHeadersMap, r)
 	if errCode != ErrUnsignedHeaders {
 		t.Fatalf("Expected the APIErrorCode to be %d, but got %d", ErrUnsignedHeaders, errCode)
 	}
@@ -400,7 +400,7 @@ func TestCheckMetaHeaders(t *testing.T) {
 	// Delete extra metadata from header to don't affect other test
 	inputHeader.Del("X-Amz-Meta-Clone")
 	// calling the function being tested.
-	errCode = checkMetaHeaders(signedHeadersMap, r)
+	errCode = checkUnsignedHeaders(signedHeadersMap, r)
 	if errCode != ErrNone {
 		t.Fatalf("Expected the APIErrorCode to be %d, but got %d", ErrNone, errCode)
 	}
@@ -413,8 +413,72 @@ func TestCheckMetaHeaders(t *testing.T) {
 
 	r.ParseForm()
 	// calling the function being tested.
-	errCode = checkMetaHeaders(signedHeadersMap, r)
+	errCode = checkUnsignedHeaders(signedHeadersMap, r)
 	if errCode != ErrNone {
 		t.Fatalf("Expected the APIErrorCode to be %d, but got %d", ErrNone, errCode)
+	}
+
+	// Regression for the unsigned x-amz-copy-source coverage gap: an x-amz-*
+	// header outside the signed-headers list (here x-amz-copy-source, which the
+	// router uses to select CopyObjectHandler) must be rejected. Previously only
+	// x-amz-meta-* headers were inspected, so this header slipped through and a
+	// presigned/authorized PUT could be turned into a server-side copy.
+	r, err = http.NewRequest(http.MethodPut, "http://play.min.io:9000", nil)
+	if err != nil {
+		t.Fatal("Unable to create http.Request :", err)
+	}
+	r.Header.Set("X-Amz-Copy-Source", "/src/secret.txt")
+	if errCode = checkUnsignedHeaders(signedHeadersMap, r); errCode != ErrUnsignedHeaders {
+		t.Fatalf("unsigned x-amz-copy-source: expected %d, got %d", ErrUnsignedHeaders, errCode)
+	}
+
+	// When the same header is part of the signed-headers list with a matching
+	// value it is allowed through, exactly as for x-amz-meta-*.
+	signedWithCopy := http.Header{}
+	for k, v := range signedHeadersMap {
+		signedWithCopy[k] = v
+	}
+	signedWithCopy.Set("X-Amz-Copy-Source", "/src/secret.txt")
+	if errCode = checkUnsignedHeaders(signedWithCopy, r); errCode != ErrNone {
+		t.Fatalf("signed x-amz-copy-source: expected %d, got %d", ErrNone, errCode)
+	}
+
+	// Membership, not value equality: an unsigned x-amz-* header whose first
+	// value is empty must still be rejected. A value-equality check would
+	// compare "" against the empty string returned for an absent signed header
+	// and wrongly let it through, so a multi-value header like
+	// {"", "/src/secret.txt"} could smuggle an unsigned copy-source.
+	r, err = http.NewRequest(http.MethodPut, "http://play.min.io:9000", nil)
+	if err != nil {
+		t.Fatal("Unable to create http.Request :", err)
+	}
+	r.Header["X-Amz-Copy-Source"] = []string{"", "/src/secret.txt"}
+	if errCode = checkUnsignedHeaders(signedHeadersMap, r); errCode != ErrUnsignedHeaders {
+		t.Fatalf("empty-first unsigned x-amz-copy-source: expected %d, got %d", ErrUnsignedHeaders, errCode)
+	}
+
+	// X-Amz-Content-Sha256 is exempt: it carries the payload hash (handled from
+	// the query for presigned and bound into the string-to-sign for signed
+	// requests), so it is allowed even when it is not in the signed-headers map.
+	r, err = http.NewRequest(http.MethodPut, "http://play.min.io:9000", nil)
+	if err != nil {
+		t.Fatal("Unable to create http.Request :", err)
+	}
+	r.Header.Set(xhttp.AmzContentSha256, unsignedPayload)
+	if errCode = checkUnsignedHeaders(signedHeadersMap, r); errCode != ErrNone {
+		t.Fatalf("unsigned x-amz-content-sha256 must be exempt: expected %d, got %d", ErrNone, errCode)
+	}
+
+	// X-Amz-Signature-Age was once a scratch header the presigned verifier wrote
+	// back and this check exempted. s3:signatureAge is now derived from the
+	// signed date, so a client that sends the header is sending an ordinary
+	// unsigned x-amz-* header and must be rejected like any other.
+	r, err = http.NewRequest(http.MethodPut, "http://play.min.io:9000", nil)
+	if err != nil {
+		t.Fatal("Unable to create http.Request :", err)
+	}
+	r.Header.Set("X-Amz-Signature-Age", "1234")
+	if errCode = checkUnsignedHeaders(signedHeadersMap, r); errCode != ErrUnsignedHeaders {
+		t.Fatalf("unsigned x-amz-signature-age must be rejected: expected %d, got %d", ErrUnsignedHeaders, errCode)
 	}
 }

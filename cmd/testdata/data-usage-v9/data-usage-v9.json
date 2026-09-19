@@ -1,0 +1,118 @@
+{
+  "Info": {
+    "Name": "/",
+    "NextCycle": 42,
+    "LastUpdate": "2026-09-15T00:00:00Z",
+    "SkipHealing": true
+  },
+  "Cache": {
+    "/": {
+      "Children": {
+        "v9-bucket": {}
+      },
+      "Size": 0,
+      "HotTierSize": 0,
+      "Objects": 0,
+      "Versions": 0,
+      "DeleteMarkers": 0,
+      "ObjSizes": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "ObjVersions": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "AllTierStats": null,
+      "Compacted": false
+    },
+    "v9-bucket": {
+      "Children": {
+        "v9-bucket/nested": {}
+      },
+      "Size": 1234,
+      "HotTierSize": 1234,
+      "Objects": 1,
+      "Versions": 1,
+      "DeleteMarkers": 0,
+      "ObjSizes": [
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "ObjVersions": [
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "AllTierStats": null,
+      "Compacted": false
+    },
+    "v9-bucket/nested": {
+      "Children": null,
+      "Size": 73728,
+      "HotTierSize": 8192,
+      "Objects": 2,
+      "Versions": 4,
+      "DeleteMarkers": 2,
+      "ObjSizes": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "ObjVersions": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      "AllTierStats": {
+        "Tiers": {
+          "COLD": {
+            "TotalSize": 65536,
+            "NumVersions": 1,
+            "NumObjects": 1
+          }
+        }
+      },
+      "Compacted": true
+    }
+  }
+}

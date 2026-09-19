@@ -69,6 +69,8 @@ func loadCPUMetrics(ctx context.Context, m MetricValues, c *metricsCache) error 
 
 	// metrics-resource.go runs a job to collect resource metrics including their Avg values and
 	// stores them in resourceMetricsMap. We can use it to get the Avg values of CPU idle and IOWait.
+	resourceMetricsMapMu.RLock()
+	defer resourceMetricsMapMu.RUnlock()
 	cpuResourceMetrics, found := resourceMetricsMap[cpuSubsystem]
 	if found {
 		if cpuIdleMetric, ok := cpuResourceMetrics[getResourceKey(cpuIdle, nil)]; ok {

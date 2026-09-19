@@ -992,6 +992,26 @@ func getClusterReplMRFFailedOperationsMD() MetricDescription {
 	}
 }
 
+func getClusterReplMRFDroppedOperationsMD() MetricDescription {
+	return MetricDescription{
+		Namespace: nodeMetricNamespace,
+		Subsystem: replicationSubsystem,
+		Name:      "mrf_dropped_operations_total",
+		Help:      "Total number of replication MRF entries dropped since server start; entries may refer to the same object",
+		Type:      counterMetric,
+	}
+}
+
+func getClusterReplMRFDroppedBytesMD() MetricDescription {
+	return MetricDescription{
+		Namespace: nodeMetricNamespace,
+		Subsystem: replicationSubsystem,
+		Name:      "mrf_dropped_bytes_total",
+		Help:      "Total known bytes of replication MRF entries dropped since server start; delete entries count as zero bytes",
+		Type:      counterMetric,
+	}
+}
+
 func getClusterRepCredentialErrorsMD(namespace MetricNamespace) MetricDescription {
 	return MetricDescription{
 		Namespace: namespace,
@@ -2423,6 +2443,8 @@ func getReplicationNodeMetrics(opts MetricsGroupOpts) *MetricsGroupV2 {
 				avgTransferRate,
 				maxTransferRate,
 				mrfCount,
+				{Description: getClusterReplMRFDroppedOperationsMD(), Value: float64(qs.MRFStats.TotalDroppedCount)},
+				{Description: getClusterReplMRFDroppedBytesMD(), Value: float64(qs.MRFStats.TotalDroppedBytes)},
 			}
 		}
 		for ep, health := range globalBucketTargetSys.healthStats() {
@@ -3314,10 +3336,10 @@ func getBucketUsageMetrics(opts MetricsGroupOpts) *MetricsGroupV2 {
 				VariableLabels: map[string]string{"bucket": bucket},
 			})
 
-			if quota != nil && quota.Quota > 0 {
+			if quotaSize := getBucketQuotaSize(quota); quotaSize > 0 {
 				metrics = append(metrics, MetricV2{
 					Description:    getBucketUsageQuotaTotalBytesMD(),
-					Value:          float64(quota.Quota),
+					Value:          float64(quotaSize),
 					VariableLabels: map[string]string{"bucket": bucket},
 				})
 			}

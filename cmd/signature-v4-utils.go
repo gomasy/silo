@@ -211,7 +211,16 @@ func extractSignedHeaders(signedHeaders []string, r *http.Request) (http.Header,
 		// `host` will not be found in the headers, can be found in r.Host.
 		// but its always necessary that the list of signed headers containing host in it.
 		val, ok := reqHeaders[http.CanonicalHeaderKey(header)]
-		if !ok {
+		if ok {
+			// Canonicalization comma-joins repeated header fields, so a signature
+			// over the single value "/src/a,tail" also verifies a request carrying
+			// ["/src/a", "tail"]. The copy handlers read only Header.Get, so that
+			// rewrite would copy a different source than the one signed. Reject a
+			// repeated x-amz-copy-source; a single value may still contain commas.
+			if len(val) > 1 && strings.EqualFold(header, strings.ToLower(xhttp.AmzCopySource)) {
+				return nil, ErrInvalidCopySource
+			}
+		} else {
 			// try to set headers from Query String
 			val, ok = reqQueries[header]
 		}
@@ -264,14 +273,40 @@ func signV4TrimAll(input string) string {
 	return strings.Join(strings.Fields(input), " ")
 }
 
-// checkMetaHeaders will check if the metadata from header/url is the same with the one from signed headers
-func checkMetaHeaders(signedHeadersMap http.Header, r *http.Request) APIErrorCode {
-	// check values from http header
-	for k, val := range r.Header {
-		if stringsHasPrefixFold(k, "X-Amz-Meta-") {
-			if signedHeadersMap.Get(k) == val[0] {
-				continue
-			}
+// checkUnsignedHeaders rejects any x-amz-* request header that is not covered by
+// the SigV4 signed-headers list. AWS S3 requires every x-amz-* header to be
+// signed and returns AccessDenied ("There were headers present in the request
+// which were not signed") otherwise. Enforcing the same here prevents an
+// unsigned x-amz-* header (for example x-amz-copy-source) from changing the
+// semantics of an already-signed or presigned request: without this check a
+// presigned PUT grant could be turned into a server-side copy that reads any
+// object the signing key can reach.
+//
+// Only headers actually sent by the client are inspected. Server-synthesized
+// x-amz-* headers (e.g. x-amz-tagging derived from a request body) are set
+// after signature verification and therefore never reach this walk.
+func checkUnsignedHeaders(signedHeadersMap http.Header, r *http.Request) APIErrorCode {
+	// check headers that arrived on the request
+	for k := range r.Header {
+		if !stringsHasPrefixFold(k, "X-Amz-") {
+			continue
+		}
+		// X-Amz-Content-Sha256 carries the payload hash, not an operation or
+		// authorization input, and is handled specially: for presigned requests
+		// it is read from the query string (getContentSha256Cksum) and any
+		// header copy is ignored, while for signed requests it is bound into the
+		// string-to-sign as the payload hash, so a tampered value fails
+		// signature verification regardless of the signed-headers list. Some
+		// clients send it as an unsigned header, so exempt it to preserve
+		// compatibility without weakening the operation-header protection.
+		if strings.EqualFold(k, xhttp.AmzContentSha256) {
+			continue
+		}
+		// The header must be a member of the signed-headers list. Testing
+		// membership (not value equality) is essential: an unsigned header whose
+		// first value is empty would otherwise compare equal to the empty string
+		// returned for an absent key and slip through.
+		if _, ok := signedHeadersMap[http.CanonicalHeaderKey(k)]; !ok {
 			return ErrUnsignedHeaders
 		}
 	}

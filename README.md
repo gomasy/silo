@@ -35,6 +35,14 @@
 > [!NOTE]
 > Renamed from `pgsty/minio` to `pgsty/silo`, default branch `master` → `main`, on 2026-08-06. Artifacts under the original MinIO identity stay published on the archived [`minio`](https://github.com/pgsty/silo/tree/minio) branch and in releases up to [`RELEASE.2026-08-04T00-00-00Z`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z).
 
+## Current release and main branch
+
+The latest published Server is [20260903](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-09-03T13-18-01Z).
+As of 2026-09-16, the main branch has newer security, storage, Console and
+shared-package changes that have not shipped in a Server release. See
+[CHANGELOG.md](CHANGELOG.md) and the [component version matrix](https://silo.pgsty.com/compatibility/versions/)
+for the exact release/source boundary, including SN-2026-011 and password-policy migration.
+
 ## Overview
 
 PGSTY SILO keeps one maintained release line of the open-source MinIO server alive after upstream ended community distribution: builds, packages, multi-arch images, security fixes, and the full web console. Pigsty runs it in production as its PostgreSQL backup repository.
@@ -85,9 +93,41 @@ Every release ships checksums, SPDX SBOMs, Sigstore-signed manifests, and GitHub
 
 ## Compatibility
 
-The S3 API, `MINIO_*` variables, `minio_*` metrics, `x-minio-*` headers, `/minio/*` routes, the `github.com/minio/*` import paths, and the on-disk format (including `.minio.sys`) are preserved and held in place by a CI compatibility check. Only Silo-owned delivery surfaces change: the `silo` executable, package, service, Helm chart, and container image — no `minio` binary alias is installed.
+Silo preserves S3 and storage-format compatibility, including existing `MINIO_*` variables, `minio_*` metrics, `x-minio-*` headers, `/minio/*` routes, and `.minio.sys` data. CI guards selected compatibility identifiers; release notes document intentional security and behavior changes. Silo-owned delivery surfaces use the `silo` executable, package, service, Helm chart, and container image; no `minio` server binary alias is installed.
+
+The supported release stack is `pgsty/silo` + `pgsty/silo-console` + `pgsty/mc` + `pgsty/silo-pkg`; compatibility with unmodified upstream MinIO/MC is best effort. The Server, Console, and client retain their historical module paths where needed, while maintained code imports `github.com/pgsty/silo-pkg/v3` directly. The SDK `github.com/minio/minio-go/v7` is an explicit upstream dependency. See the current [go.mod](go.mod) for versions and replacements.
 
 Every divergence from upstream is listed in the code-verified [compatibility audit](https://silo.pgsty.com/compatibility/server/). Treat each release as a downstream upgrade: pin versions, read the [release notes](https://silo.pgsty.com/tags/silo/), and keep a rollback path.
+
+### TLS and Go upgrades
+
+The following TLS repair is on main and is not included in Server 20260903.
+With that repair, TLS key exchange follows Go's defaults across the S3 listener, node links,
+replication, identity providers, etcd, and external HTTP services. If an endpoint
+cannot accept ML-KEM, `GODEBUG=tlsmlkem=0` disables the default hybrid exchanges
+for the process; certificate verification remains enabled. This option does not
+disable ML-DSA signatures or resolve every TLS reset. Prefer updating the
+incompatible endpoint before removing the temporary setting.
+If only the new SecP hybrids cause problems, `GODEBUG=tlssecpmlkem=0` disables
+those groups while retaining X25519MLKEM768.
+
+For builds targeting Go 1.27, setting either `SSL_CERT_FILE` or `SSL_CERT_DIR`
+on macOS replaces Keychain trust with on-disk roots and Go's verifier. Stale or
+incomplete CA paths can break previously trusted connections; unset inherited
+values to restore Keychain trust. Explicit certificates in the configured `CAs`
+directory remain additive to the selected root pool.
+Go 1.27 binaries require macOS 13 or later. See the
+[Go release notes](https://go.dev/doc/go1.27) and the
+[Go 1.27 TLS and OIDC discovery guide](https://silo.pgsty.com/blog/design/go127-tls-oidc-discovery/).
+
+## Documentation ownership
+
+User documentation is maintained at [silo.pgsty.com](https://silo.pgsty.com/docs/),
+with source in [pgsty/silo.pgsty.com](https://github.com/pgsty/silo.pgsty.com).
+The remaining `docs/` tree contains inherited references, examples, and tooling
+fixtures. Investigation logs, AI work records, and temporary reports are kept
+outside this repository; reusable findings belong in the companion site.
+See [AGENTS.md](AGENTS.md) for repository ownership and maintenance rules.
 
 ## Security & Contributing
 
@@ -95,53 +135,25 @@ Report vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md); e
 
 ## Contributors
 
-<table>
-  <tr>
-    <td align="center" width="150">
-      <a href="https://github.com/ZouhairCharef"><img src="https://github.com/ZouhairCharef.png?size=100" width="72" alt="ZouhairCharef"><br><sub><b>@ZouhairCharef</b></sub></a><br><sub>CVE-2026-34986</sub>
-    </td>
-    <td align="center" width="150">
-      <a href="https://github.com/mfredenhagen"><img src="https://github.com/mfredenhagen.png?size=100" width="72" alt="mfredenhagen"><br><sub><b>@mfredenhagen</b></sub></a><br><sub>CVE-2026-39883</sub>
-    </td>
-    <td align="center" width="150">
-      <a href="https://github.com/pinginfo"><img src="https://github.com/pinginfo.png?size=100" width="72" alt="pinginfo"><br><sub><b>@pinginfo</b></sub></a><br><sub>Notification streaming</sub>
-    </td>
-    <td align="center" width="150">
-      <a href="https://github.com/waterkip"><img src="https://github.com/waterkip.png?size=100" width="72" alt="waterkip"><br><sub><b>@waterkip</b></sub></a><br><sub>Documentation links</sub>
-    </td>
-  </tr>
-</table>
-<p>
-<a href="https://github.com/magicxor"><img src="https://github.com/magicxor.png?size=64" width="44" alt="magicxor" title="@magicxor"></a>
-<a href="https://github.com/ycjlin"><img src="https://github.com/ycjlin.png?size=64" width="44" alt="ycjlin" title="@ycjlin"></a>
-<a href="https://github.com/h5vx"><img src="https://github.com/h5vx.png?size=64" width="44" alt="h5vx" title="@h5vx"></a>
-<a href="https://github.com/Dansyuqri"><img src="https://github.com/Dansyuqri.png?size=64" width="44" alt="Dansyuqri" title="@Dansyuqri"></a>
-<a href="https://github.com/davinkevin"><img src="https://github.com/davinkevin.png?size=64" width="44" alt="davinkevin" title="@davinkevin"></a>
-<a href="https://github.com/lem21h"><img src="https://github.com/lem21h.png?size=64" width="44" alt="lem21h" title="@lem21h"></a>
-<a href="https://github.com/sulin37392"><img src="https://github.com/sulin37392.png?size=64" width="44" alt="sulin37392" title="@sulin37392"></a>
-<a href="https://github.com/mosesdd"><img src="https://github.com/mosesdd.png?size=64" width="44" alt="mosesdd" title="@mosesdd"></a>
-<a href="https://github.com/Xavier-777"><img src="https://github.com/Xavier-777.png?size=64" width="44" alt="Xavier-777" title="@Xavier-777"></a>
-<a href="https://github.com/jiadzh"><img src="https://github.com/jiadzh.png?size=64" width="44" alt="jiadzh" title="@jiadzh"></a>
-<a href="https://github.com/TLINDEN"><img src="https://github.com/TLINDEN.png?size=64" width="44" alt="TLINDEN" title="@TLINDEN"></a>
-<a href="https://github.com/AntonOfTheWoods"><img src="https://github.com/AntonOfTheWoods.png?size=64" width="44" alt="AntonOfTheWoods" title="@AntonOfTheWoods"></a>
-<a href="https://github.com/zylpsrs"><img src="https://github.com/zylpsrs.png?size=64" width="44" alt="zylpsrs" title="@zylpsrs"></a>
-<a href="https://github.com/nsanitate"><img src="https://github.com/nsanitate.png?size=64" width="44" alt="nsanitate" title="@nsanitate"></a>
-<a href="https://github.com/makinikm"><img src="https://github.com/makinikm.png?size=64" width="44" alt="makinikm" title="@makinikm"></a>
-<a href="https://github.com/spaceg00se-r"><img src="https://github.com/spaceg00se-r.png?size=64" width="44" alt="spaceg00se-r" title="@spaceg00se-r"></a>
-<a href="https://github.com/heroes1412"><img src="https://github.com/heroes1412.png?size=64" width="44" alt="heroes1412" title="@heroes1412"></a>
-<a href="https://github.com/vampywiz17"><img src="https://github.com/vampywiz17.png?size=64" width="44" alt="vampywiz17" title="@vampywiz17"></a>
-<a href="https://github.com/chalukyaj"><img src="https://github.com/chalukyaj.png?size=64" width="44" alt="chalukyaj" title="@chalukyaj"></a>
-<a href="https://github.com/cbornet"><img src="https://github.com/cbornet.png?size=64" width="44" alt="cbornet" title="@cbornet"></a>
-<a href="https://github.com/jvasile"><img src="https://github.com/jvasile.png?size=64" width="44" alt="jvasile" title="@jvasile"></a>
-<a href="https://github.com/Kesavaambati"><img src="https://github.com/Kesavaambati.png?size=64" width="44" alt="Kesavaambati" title="@Kesavaambati"></a>
-<a href="https://github.com/redfoxfox"><img src="https://github.com/redfoxfox.png?size=64" width="44" alt="redfoxfox" title="@redfoxfox"></a>
-<a href="https://github.com/kuldeep-link11"><img src="https://github.com/kuldeep-link11.png?size=64" width="44" alt="kuldeep-link11" title="@kuldeep-link11"></a>
-<a href="https://github.com/meesudzu"><img src="https://github.com/meesudzu.png?size=64" width="44" alt="meesudzu" title="@meesudzu"></a>
-<a href="https://github.com/pmezhuev"><img src="https://github.com/pmezhuev.png?size=64" width="44" alt="pmezhuev" title="@pmezhuev"></a>
-<a href="https://github.com/kh0mka"><img src="https://github.com/kh0mka.png?size=64" width="44" alt="kh0mka" title="@kh0mka"></a>
-</p>
+<!-- Generated by silo.pgsty.com/bin/contributors.py. -->
 
-GitHub does not generate a contributor graph for forks, so [`CONTRIBUTORS.md`](CONTRIBUTORS.md) — not the Insights page — is this project's attribution record. It names everyone alongside the change or report they contributed.
+Every human issue or pull-request author is part of the SILO community, including open and unmerged work. Merged fixes, adopted proposals, and actionable reports receive priority, with first participation guiding the remaining order. Gold rings highlight reviewed significant contributions.
+
+<a href="CONTRIBUTORS.md">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/pgsty/silo/codex/repository-cards/contributors-dark.svg">
+  <img src="https://raw.githubusercontent.com/pgsty/silo/codex/repository-cards/contributors-light.svg" alt="SILO community contributors">
+</picture>
+</a>
+
+[View contribution notes and actual PR status](CONTRIBUTORS.md).
+
+## Star History
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/pgsty/silo/codex/repository-cards/star-history-dark.svg">
+  <img src="https://raw.githubusercontent.com/pgsty/silo/codex/repository-cards/star-history-light.svg" alt="SILO GitHub star history">
+</picture>
 
 ## Background
 

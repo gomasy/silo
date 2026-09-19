@@ -26,6 +26,7 @@ import (
 	"strings"
 	"testing"
 
+	consoleapi "github.com/minio/console/api"
 	"github.com/minio/minio/internal/config"
 )
 
@@ -370,5 +371,140 @@ func TestConfigEnvFileNamedTargetDiscovery(t *testing.T) {
 	}
 	if !slices.Contains(targets, "my-hook") {
 		t.Fatalf("named target %q not discovered from %s: %v", "my-hook", key, targets)
+	}
+}
+
+// TestConsoleMinIOServerEnv locks in the loopback TLS exemption that keeps
+// embedded Console login working (issue #108) while ensuring an explicitly
+// configured endpoint is never silently exempted from TLS verification.
+func TestConsoleMinIOServerEnv(t *testing.T) {
+	tests := []struct {
+		name           string
+		endpoint       string
+		isTLS          bool
+		port           string
+		wantServer     string
+		wantSkipVerify bool
+	}{
+		{
+			name:           "loopback TLS is exempted so embedded login works",
+			isTLS:          true,
+			port:           "9000",
+			wantServer:     "https://127.0.0.1:9000",
+			wantSkipVerify: true,
+		},
+		{
+			name:       "loopback plain HTTP needs no exemption",
+			isTLS:      false,
+			port:       "9000",
+			wantServer: "http://127.0.0.1:9000",
+		},
+		{
+			name:       "explicit https endpoint stays verified",
+			endpoint:   "https://silo.example:9000",
+			isTLS:      true,
+			port:       "9000",
+			wantServer: "https://silo.example:9000",
+		},
+		{
+			name:       "explicit http endpoint stays verified",
+			endpoint:   "http://silo.example:9000",
+			isTLS:      false,
+			port:       "9000",
+			wantServer: "http://silo.example:9000",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, skipVerify := consoleMinIOServerEnv(tt.endpoint, tt.isTLS, tt.port)
+			if server != tt.wantServer {
+				t.Fatalf("server = %q, want %q", server, tt.wantServer)
+			}
+			if skipVerify != tt.wantSkipVerify {
+				t.Fatalf("skipVerify = %v, want %v", skipVerify, tt.wantSkipVerify)
+			}
+		})
+	}
+}
+
+// The startup path clears process environment, so preserve all existing Console
+// variables, including ones unrelated to this test, before exercising it.
+func preserveConsoleEnvironment(t *testing.T) {
+	t.Helper()
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, consolePrefix) {
+			name, value, _ := strings.Cut(entry, "=")
+			t.Setenv(name, value)
+		}
+	}
+}
+
+func TestResetConsoleEnvironment(t *testing.T) {
+	preserveConsoleEnvironment(t)
+	settings := map[string]string{
+		consoleapi.ConsoleWSMaxConnections:                   "2048",
+		consoleapi.ConsoleWSMaxConnectionsPerClient:          "512",
+		consoleapi.ConsoleWSMaxAnonymousConnections:          "128",
+		consoleapi.ConsoleWSMaxAnonymousConnectionsPerClient: "16",
+	}
+	for key, value := range settings {
+		t.Setenv(key, value)
+	}
+	decoys := []string{"CONSOLE_MINIO_SERVER_TLS_SKIP_VERIFY", "CONSOLE_MINIO_SERVER", "CONSOLE_PBKDF_SALT", "CONSOLE_TRUSTED_PROXIES", "CONSOLE_WS_MAX_UNKNOWN"}
+	for _, key := range decoys {
+		t.Setenv(key, "operator-value")
+	}
+	resetConsoleEnvironment()
+	for key, want := range settings {
+		if got, present := os.LookupEnv(key); !present || got != want {
+			t.Errorf("%s = %q, present = %v; want %q", key, got, present, want)
+		}
+	}
+	for _, key := range decoys {
+		if _, present := os.LookupEnv(key); present {
+			t.Errorf("unsupported override %s survived", key)
+		}
+	}
+	for _, raw := range []string{"", " 16 ", "env://missing-limit"} {
+		t.Setenv(consoleapi.ConsoleWSMaxAnonymousConnectionsPerClient, raw)
+		resetConsoleEnvironment()
+		if got, present := os.LookupEnv(consoleapi.ConsoleWSMaxAnonymousConnectionsPerClient); !present || got != raw {
+			t.Fatalf("raw value %q was changed to %q (present = %v)", raw, got, present)
+		}
+	}
+	os.Unsetenv(consoleapi.ConsoleWSMaxAnonymousConnectionsPerClient)
+	resetConsoleEnvironment()
+	if _, present := os.LookupEnv(consoleapi.ConsoleWSMaxAnonymousConnectionsPerClient); present {
+		t.Fatal("unset setting became present")
+	}
+}
+
+func TestInitConsoleServerConfigurationErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name, proxy, limit, want string
+	}{
+		{"proxy error precedes limit error", "proxy.internal", "bad", "MINIO_API_TRUSTED_PROXIES"},
+		{"blank limit", "", "", "CONSOLE_WS_MAX_ANONYMOUS_CONNECTIONS_PER_CLIENT"},
+		{"non-integer limit", "", "bad", "CONSOLE_WS_MAX_ANONYMOUS_CONNECTIONS_PER_CLIENT"},
+		{"out-of-range limit", "", "0", "CONSOLE_WS_MAX_ANONYMOUS_CONNECTIONS_PER_CLIENT"},
+		{"inconsistent limits", "", "256", "must be less than"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Restore the process-wide library configuration after environment cleanup.
+			t.Cleanup(func() {
+				_ = consoleapi.ConfigureEmbeddedSourceIPTrust()
+				_ = consoleapi.ConfigureWebSocketLimits()
+			})
+			preserveConsoleEnvironment(t)
+			t.Setenv(consoleapi.EnvMinIOTrustedProxies, tt.proxy)
+			t.Setenv(consoleapi.ConsoleWSMaxConnections, "1024")
+			t.Setenv(consoleapi.ConsoleWSMaxConnectionsPerClient, "256")
+			t.Setenv(consoleapi.ConsoleWSMaxAnonymousConnections, "64")
+			t.Setenv(consoleapi.ConsoleWSMaxAnonymousConnectionsPerClient, tt.limit)
+			server, err := initConsoleServer()
+			if err == nil || !strings.Contains(err.Error(), tt.want) || server != nil {
+				t.Fatalf("initConsoleServer() = %v, %v; want nil server and %q error", server, err, tt.want)
+			}
+		})
 	}
 }

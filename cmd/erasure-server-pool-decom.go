@@ -618,7 +618,7 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, idx int, bu
 	if objInfo.isMultipart() {
 		res, err := z.NewMultipartUpload(ctx, bucket, objInfo.Name, ObjectOptions{
 			VersionID:    objInfo.VersionID,
-			UserDefined:  objInfo.UserDefined,
+			UserDefined:  migrationObjectMetadata(objInfo),
 			NoAuditLog:   true,
 			SrcPoolIdx:   idx,
 			DataMovement: true,
@@ -681,7 +681,7 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, idx int, bu
 			SrcPoolIdx:   idx,
 			VersionID:    objInfo.VersionID,
 			MTime:        objInfo.ModTime,
-			UserDefined:  objInfo.UserDefined,
+			UserDefined:  migrationObjectMetadata(objInfo),
 			PreserveETag: objInfo.ETag, // Preserve original ETag to ensure same metadata.
 			IndexCB: func() []byte {
 				return objInfo.Parts[0].Index // Preserve part Index to ensure decompression works.

@@ -99,8 +99,12 @@ type ObjectOptions struct {
 	ReplicationSourceTaggingTimestamp   time.Time // set if MinIOSourceTaggingTimestamp received
 	ReplicationSourceLegalholdTimestamp time.Time // set if MinIOSourceObjectLegalholdTimestamp received
 	ReplicationSourceRetentionTimestamp time.Time // set if MinIOSourceObjectRetentionTimestamp received
+	ReplicaLockReconcile                bool      // re-order a trusted replica write against the destination version under the object write lock
 	DeletePrefix                        bool      // set true to enforce a prefix deletion, only application for DeleteObject API,
 	DeletePrefixObject                  bool      // set true when object's erasure set is resolvable by object name (using getHashedSetIndex)
+
+	// Pools-layer version resolver; the caller holds the shared object lock.
+	replicaObjectInfo GetObjectInfoFn
 
 	Speedtest bool // object call specifically meant for SpeedTest code, set to 'true' when invoked by SpeedtestHandler.
 
@@ -131,8 +135,8 @@ type ObjectOptions struct {
 	// when looking up a version by fi.VersionID
 	InclFreeVersions bool
 	// SkipFreeVersion skips adding a free version when a tiered version is
-	// being 'replaced'
-	// Note: Used only when a tiered object is being expired.
+	// being replaced. Used when expiring tiered content or retiring a copy
+	// whose tier reference is still owned by another copy.
 	SkipFreeVersion bool
 
 	MetadataChg           bool                  // is true if it is a metadata update operation.

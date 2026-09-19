@@ -62,10 +62,10 @@ dist/
 
 .claude/
 .codex/
-AGENTS.md
-CLAUDE.md
 _bmad/
 _bmad-output/
+# Investigation and editorial working files belong outside this repository.
+docs/investigations/
 docs/security/
 docs/rebranding.md
 .release-sign/

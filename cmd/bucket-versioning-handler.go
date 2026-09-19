@@ -97,7 +97,7 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 		return
 	}
 
-	updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, configData)
+	result, err := globalBucketMetadataSys.updateAndParseMetadata(ctx, bucket, bucketVersioningConfig, configData, false, false, nil)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -107,12 +107,12 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 	//
 	// We encode the xml bytes as base64 to ensure there are no encoding
 	// errors.
-	cfgStr := base64.StdEncoding.EncodeToString(configData)
+	cfgStr := base64.StdEncoding.EncodeToString(result.meta.VersioningConfigXML)
 	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:       madmin.SRBucketMetaTypeVersionConfig,
 		Bucket:     bucket,
 		Versioning: &cfgStr,
-		UpdatedAt:  updatedAt,
+		UpdatedAt:  result.updatedAt,
 	}))
 
 	writeSuccessResponseHeadersOnly(w)

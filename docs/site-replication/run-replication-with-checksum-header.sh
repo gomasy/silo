@@ -33,7 +33,7 @@ cleanup
 export MINIO_CI_CD=1
 export MINIO_BROWSER=off
 export MINIO_ROOT_USER="minio"
-export MINIO_ROOT_PASSWORD="silo123"
+export MINIO_ROOT_PASSWORD="silo12345"
 
 # Download AWS CLI
 echo -n "Download and install AWS CLI"
@@ -51,7 +51,7 @@ cat >~/.aws/credentials <<EOF
 [enterprise]
 region = us-east-1
 aws_access_key_id = minio
-aws_secret_access_key = silo123
+aws_secret_access_key = silo12345
 EOF
 
 # Create certificates for TLS enabled Silo
@@ -65,8 +65,8 @@ echo "done"
 
 # Start Silo instances
 echo -n "Starting Silo instances ..."
-CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo123 silo server --certs-dir /tmp/certs --address ":9001" --console-address ":10000" /tmp/silo1/{1...4}/disk{1...4} /tmp/silo1/{5...8}/disk{1...4} >/tmp/silo1_1.log 2>&1 &
-CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo123 silo server --certs-dir /tmp/certs --address ":9002" --console-address ":11000" /tmp/silo2/{1...4}/disk{1...4} /tmp/silo2/{5...8}/disk{1...4} >/tmp/silo2_1.log 2>&1 &
+CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo12345 silo server --certs-dir /tmp/certs --address ":9001" --console-address ":10000" /tmp/silo1/{1...4}/disk{1...4} /tmp/silo1/{5...8}/disk{1...4} >/tmp/silo1_1.log 2>&1 &
+CI=on MINIO_KMS_SECRET_KEY=minio-default-key:IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= MINIO_ROOT_USER=minio MINIO_ROOT_PASSWORD=silo12345 silo server --certs-dir /tmp/certs --address ":9002" --console-address ":11000" /tmp/silo2/{1...4}/disk{1...4} /tmp/silo2/{5...8}/disk{1...4} >/tmp/silo2_1.log 2>&1 &
 echo "done"
 
 if [ ! -f ./mc ]; then
@@ -75,8 +75,8 @@ if [ ! -f ./mc ]; then
 	echo "done"
 fi
 
-export MC_HOST_silo1=https://minio:silo123@localhost:9001
-export MC_HOST_silo2=https://minio:silo123@localhost:9002
+export MC_HOST_silo1=https://minio:silo12345@localhost:9001
+export MC_HOST_silo2=https://minio:silo12345@localhost:9002
 
 ./mc ready silo1 --insecure
 ./mc ready silo2 --insecure

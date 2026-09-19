@@ -45,6 +45,7 @@ type IAMObjectStore struct {
 	sync.RWMutex
 
 	*iamCache
+	index iamRevisionIndex
 
 	usersSysType UsersSysType
 
@@ -52,12 +53,16 @@ type IAMObjectStore struct {
 }
 
 func newIAMObjectStore(objAPI ObjectLayer, usersSysType UsersSysType) *IAMObjectStore {
-	return &IAMObjectStore{
+	store := &IAMObjectStore{
 		iamCache:     newIamCache(),
 		objAPI:       objAPI,
 		usersSysType: usersSysType,
 	}
+	store.revisions = &store.index
+	return store
 }
+
+func (iamOS *IAMObjectStore) revisionIndex() *iamRevisionIndex { return &iamOS.index }
 
 func (iamOS *IAMObjectStore) rlock() *iamCache {
 	iamOS.RLock()
@@ -87,6 +92,7 @@ func (iamOS *IAMObjectStore) saveIAMConfig(ctx context.Context, item any, objPat
 	if err != nil {
 		return err
 	}
+	plain := data
 	if GlobalKMS != nil {
 		data, err = config.EncryptBytes(GlobalKMS, data, kms.Context{
 			minioMetaBucket: path.Join(minioMetaBucket, objPath),
@@ -95,7 +101,11 @@ func (iamOS *IAMObjectStore) saveIAMConfig(ctx context.Context, item any, objPat
 			return err
 		}
 	}
-	return saveConfig(ctx, iamOS.objAPI, objPath, data)
+	if err := saveConfig(ctx, iamOS.objAPI, objPath, data); err != nil {
+		return err
+	}
+	iamOS.index.observe(objPath, plain)
+	return nil
 }
 
 func decryptData(data []byte, objPath string) ([]byte, error) {
@@ -133,6 +143,7 @@ func (iamOS *IAMObjectStore) loadIAMConfigBytesWithMetadata(ctx context.Context,
 	if err != nil {
 		return nil, meta, err
 	}
+	iamOS.index.observe(objPath, data)
 	return data, meta, nil
 }
 
@@ -146,7 +157,11 @@ func (iamOS *IAMObjectStore) loadIAMConfig(ctx context.Context, item any, objPat
 }
 
 func (iamOS *IAMObjectStore) deleteIAMConfig(ctx context.Context, path string) error {
-	return deleteConfig(ctx, iamOS.objAPI, path)
+	if err := deleteConfig(ctx, iamOS.objAPI, path); err != nil {
+		return err
+	}
+	iamOS.index.forget(path)
+	return nil
 }
 
 func (iamOS *IAMObjectStore) loadPolicyDocWithRetry(ctx context.Context, policy string, m map[string]PolicyDoc, retries int) error {
@@ -169,6 +184,10 @@ func (iamOS *IAMObjectStore) loadPolicyDocWithRetry(ctx context.Context, policy 
 		err = p.parseJSON(data)
 		if err != nil {
 			return err
+		}
+
+		if p.Deleted {
+			return errNoSuchPolicy
 		}
 
 		if p.Version == 0 {
@@ -198,6 +217,10 @@ func (iamOS *IAMObjectStore) loadPolicy(ctx context.Context, policy string) (Pol
 	err = p.parseJSON(data)
 	if err != nil {
 		return p, err
+	}
+
+	if p.Deleted {
+		return PolicyDoc{}, errNoSuchPolicy
 	}
 
 	if p.Version == 0 {
@@ -245,6 +268,9 @@ func (iamOS *IAMObjectStore) loadSecretKey(ctx context.Context, user string, use
 		}
 		return "", err
 	}
+	if u.Deleted {
+		return "", errNoSuchUser
+	}
 	return u.Credentials.SecretKey, nil
 }
 
@@ -258,10 +284,15 @@ func (iamOS *IAMObjectStore) loadUserIdentity(ctx context.Context, user string, 
 		return u, err
 	}
 
+	if u.Deleted {
+		if userType == stsUser && !u.ExpiresAt.IsZero() && UTCNow().After(u.ExpiresAt) {
+			bestEffortIAMExpiration(ctx, iamOS, getUserIdentityPath(user, userType))
+		}
+		return UserIdentity{}, errNoSuchUser
+	}
+
 	if u.Credentials.IsExpired() {
-		// Delete expired identity - ignoring errors here.
-		iamOS.deleteIAMConfig(ctx, getUserIdentityPath(user, userType))
-		iamOS.deleteIAMConfig(ctx, getMappedPolicyPath(user, userType, false))
+		bestEffortIAMExpiration(ctx, iamOS, getUserIdentityPath(user, userType))
 		return u, errNoSuchUser
 	}
 
@@ -272,15 +303,17 @@ func (iamOS *IAMObjectStore) loadUserIdentity(ctx context.Context, user string, 
 	if u.Credentials.SessionToken != "" {
 		jwtClaims, err := extractJWTClaims(u)
 		if err != nil {
-			if u.Credentials.IsTemp() {
-				// We should delete such that the client can re-request
-				// for the expiring credentials.
-				iamOS.deleteIAMConfig(ctx, getUserIdentityPath(user, userType))
-				iamOS.deleteIAMConfig(ctx, getMappedPolicyPath(user, userType, false))
-			}
-			return u, errNoSuchUser
+			// During startup the site signing key may not be available yet.
+			// Reject this load without deleting a credential that has not expired.
+			return UserIdentity{}, errNoSuchUser
 		}
 		u.Credentials.Claims = jwtClaims.Map()
+	}
+	if err := checkIAMParentRevision(ctx, iamOS, u.Credentials); err != nil {
+		if errors.Is(err, errIAMStaleUpdate) {
+			return UserIdentity{}, errNoSuchUser
+		}
+		return UserIdentity{}, err
 	}
 
 	if u.Credentials.Description == "" {
@@ -320,6 +353,7 @@ func (iamOS *IAMObjectStore) loadUser(ctx context.Context, user string, userType
 }
 
 func (iamOS *IAMObjectStore) loadUsers(ctx context.Context, userType IAMUserType, m map[string]UserIdentity) error {
+	ctx = withIAMExpirationCleanup(ctx)
 	var basePrefix string
 	switch userType {
 	case svcUser:
@@ -353,6 +387,9 @@ func (iamOS *IAMObjectStore) loadGroup(ctx context.Context, group string, m map[
 			return errNoSuchGroup
 		}
 		return err
+	}
+	if g.Deleted {
+		return errNoSuchGroup
 	}
 	m[group] = g
 	return nil
@@ -391,6 +428,9 @@ func (iamOS *IAMObjectStore) loadMappedPolicyWithRetry(ctx context.Context, name
 			goto retry
 		}
 
+		if !iamOS.index.mappingAllowed(getMappedPolicyPath(name, userType, isGroup), p) {
+			return errNoSuchPolicy
+		}
 		m.Store(name, p)
 		return nil
 	}
@@ -404,6 +444,9 @@ func (iamOS *IAMObjectStore) loadMappedPolicyInternal(ctx context.Context, name 
 			return p, errNoSuchPolicy
 		}
 		return p, err
+	}
+	if !iamOS.index.mappingAllowed(getMappedPolicyPath(name, userType, isGroup), p) {
+		return MappedPolicy{}, errNoSuchPolicy
 	}
 	return p, nil
 }
@@ -822,54 +865,6 @@ func (iamOS *IAMObjectStore) loadAllFromObjStore(ctx context.Context, cache *iam
 	})
 
 	return nil
-}
-
-func (iamOS *IAMObjectStore) savePolicyDoc(ctx context.Context, policyName string, p PolicyDoc) error {
-	return iamOS.saveIAMConfig(ctx, &p, getPolicyDocPath(policyName))
-}
-
-func (iamOS *IAMObjectStore) saveMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, mp MappedPolicy, opts ...options) error {
-	return iamOS.saveIAMConfig(ctx, mp, getMappedPolicyPath(name, userType, isGroup), opts...)
-}
-
-func (iamOS *IAMObjectStore) saveUserIdentity(ctx context.Context, name string, userType IAMUserType, u UserIdentity, opts ...options) error {
-	return iamOS.saveIAMConfig(ctx, u, getUserIdentityPath(name, userType), opts...)
-}
-
-func (iamOS *IAMObjectStore) saveGroupInfo(ctx context.Context, name string, gi GroupInfo) error {
-	return iamOS.saveIAMConfig(ctx, gi, getGroupInfoPath(name))
-}
-
-func (iamOS *IAMObjectStore) deletePolicyDoc(ctx context.Context, name string) error {
-	err := iamOS.deleteIAMConfig(ctx, getPolicyDocPath(name))
-	if err == errConfigNotFound {
-		err = errNoSuchPolicy
-	}
-	return err
-}
-
-func (iamOS *IAMObjectStore) deleteMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool) error {
-	err := iamOS.deleteIAMConfig(ctx, getMappedPolicyPath(name, userType, isGroup))
-	if err == errConfigNotFound {
-		err = errNoSuchPolicy
-	}
-	return err
-}
-
-func (iamOS *IAMObjectStore) deleteUserIdentity(ctx context.Context, name string, userType IAMUserType) error {
-	err := iamOS.deleteIAMConfig(ctx, getUserIdentityPath(name, userType))
-	if err == errConfigNotFound {
-		err = errNoSuchUser
-	}
-	return err
-}
-
-func (iamOS *IAMObjectStore) deleteGroupInfo(ctx context.Context, name string) error {
-	err := iamOS.deleteIAMConfig(ctx, getGroupInfoPath(name))
-	if err == errConfigNotFound {
-		err = errNoSuchGroup
-	}
-	return err
 }
 
 // Lists objects in the minioMetaBucket at the given path prefix. All returned

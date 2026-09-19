@@ -624,6 +624,10 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 
 	claims[expClaim] = UTCNow().Add(duration).Unix()
 	claims[parentClaim] = user.AccessKey
+	if err := setIAMParentRevocationClaim(ctx, globalIAMSys.store, user.AccessKey, claims); err != nil {
+		writeSTSErrorResponse(ctx, w, ErrSTSInternalError, err)
+		return
+	}
 
 	tokenRevokeType := r.Form.Get(stsRevokeTokenType)
 	if tokenRevokeType != "" {

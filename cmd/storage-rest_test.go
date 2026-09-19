@@ -109,6 +109,15 @@ func testStorageAPIListDir(t *testing.T, storage StorageAPI) {
 			}
 		}
 	}
+	for _, name := range []string{"one", "two", "three"} {
+		if err := storage.AppendFile(t.Context(), "foo", "bounded/"+name, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := storage.ListDir(t.Context(), "", "foo", "bounded", 2)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("ListDir count was lost in storage/RPC path: %v %v", entries, err)
+	}
 }
 
 func testStorageAPIReadAll(t *testing.T, storage StorageAPI) {

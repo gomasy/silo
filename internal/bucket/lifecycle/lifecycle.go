@@ -158,6 +158,12 @@ func (lc *Lifecycle) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err e
 					return err
 				}
 				lc.ExpiryUpdatedAt = &t
+			case "AccessTierQuota":
+				// Ignore the retired access-tier extension in stored configs.
+				// PUT uses this parser too, so it also accepts and drops it.
+				if err = d.Skip(); err != nil {
+					return err
+				}
 			default:
 				return xml.UnmarshalError(fmt.Sprintf("expected element type <Rule> but have <%s>", se.Name.Local))
 			}

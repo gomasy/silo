@@ -165,6 +165,11 @@ func testAPIZeroByteSSECAuthenticatesKey(obj ObjectLayer, instanceType, bucketNa
 		t.Fatal(err)
 	}
 	req.Header.Set(xhttp.AmzCopySource, SlashSeparator+pathJoin(bucketName, object))
+	// Re-sign so x-amz-copy-source is covered by the signature, as real S3
+	// clients send it; the verifier rejects unsigned x-amz-* headers.
+	if err = signRequestV4(req, credentials.AccessKey, credentials.SecretKey); err != nil {
+		t.Fatalf("%s: failed to re-sign UploadPartCopy request: %v", instanceType, err)
+	}
 	rec = httptest.NewRecorder()
 	apiRouter.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {

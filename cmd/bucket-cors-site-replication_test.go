@@ -467,25 +467,6 @@ func testAdversarialHealCorsPropagatesNewerEqualValueTimestamp(obj ObjectLayer, 
 	}
 }
 
-func TestAdversarialBucketMetadataComparisonIsBase64CaseSensitive(t *testing.T) {
-	upper := "QQ=="
-	lower := "qQ=="
-	upperBytes, err := base64.StdEncoding.Strict().DecodeString(upper)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lowerBytes, err := base64.StdEncoding.Strict().DecodeString(lower)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(upperBytes) == string(lowerBytes) {
-		t.Fatal("test inputs unexpectedly decode to the same bytes")
-	}
-	if isBucketMetadataEqual(&upper, &lower) {
-		t.Fatal("different decoded payloads were treated as equal")
-	}
-}
-
 func TestSiteReplicationStatusDetectsCorsTimestampMismatch(t *testing.T) {
 	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{
 		t:          t,

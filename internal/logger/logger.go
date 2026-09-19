@@ -395,9 +395,9 @@ func consoleLogIf(ctx context.Context, subsystem string, err error, errKind ...a
 	if err == nil {
 		return
 	}
-	if consoleTgt != nil {
+	if console := consoleTgt.Load(); console != nil {
 		entry := errToEntry(ctx, subsystem, err, errKind...)
-		consoleTgt.Send(ctx, entry)
+		(*console).Send(ctx, entry)
 	}
 }
 
@@ -423,8 +423,8 @@ func sendLog(ctx context.Context, entry log.Entry) {
 	// Iterate over all logger targets to send the log entry
 	for _, t := range systemTgts {
 		if err := t.Send(ctx, entry); err != nil {
-			if consoleTgt != nil { // Sending to the console never fails
-				consoleTgt.Send(ctx, errToEntry(ctx, "logging", fmt.Errorf("unable to send log event to Logger target (%s): %v", t.String(), err), entry.Level))
+			if console := consoleTgt.Load(); console != nil { // Sending to the console never fails
+				(*console).Send(ctx, errToEntry(ctx, "logging", fmt.Errorf("unable to send log event to Logger target (%s): %v", t.String(), err), entry.Level))
 			}
 		}
 	}

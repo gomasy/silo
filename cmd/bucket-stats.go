@@ -319,7 +319,9 @@ func (r *ReplicationStats) getNodeQueueStats(bucket string) (qs ReplQNodeStats) 
 	qs.QStats = r.qCache.getBucketStats(bucket)
 	qs.TgtXferStats = make(map[string]map[RMetricName]XferStats)
 	qs.MRFStats = ReplicationMRFStats{
-		LastFailedCount: atomic.LoadUint64(&r.mrfStats.LastFailedCount),
+		LastFailedCount:   atomic.LoadUint64(&r.mrfStats.LastFailedCount),
+		TotalDroppedCount: atomic.LoadUint64(&r.mrfStats.TotalDroppedCount),
+		TotalDroppedBytes: atomic.LoadUint64(&r.mrfStats.TotalDroppedBytes),
 	}
 
 	r.RLock()
@@ -410,7 +412,9 @@ func (r *ReplicationStats) getNodeQueueStatsSummary() (qs ReplQNodeStats) {
 	qs.XferStats = make(map[RMetricName]XferStats)
 	qs.QStats = r.qCache.getSiteStats()
 	qs.MRFStats = ReplicationMRFStats{
-		LastFailedCount: atomic.LoadUint64(&r.mrfStats.LastFailedCount),
+		LastFailedCount:   atomic.LoadUint64(&r.mrfStats.LastFailedCount),
+		TotalDroppedCount: atomic.LoadUint64(&r.mrfStats.TotalDroppedCount),
+		TotalDroppedBytes: atomic.LoadUint64(&r.mrfStats.TotalDroppedBytes),
 	}
 	r.RLock()
 	defer r.RUnlock()

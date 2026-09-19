@@ -1068,6 +1068,11 @@ func (er erasureObjects) HealObject(ctx context.Context, bucket, object, version
 		newReqInfo = logger.NewReqInfo("", "", globalDeploymentID(), "", "Heal", bucket, object)
 	}
 	healCtx := logger.SetReqInfo(GlobalContext, newReqInfo)
+	if opts.NoLock {
+		// The caller owns the namespace lock. Stop if that lock's context is
+		// canceled instead of continuing metadata writes after losing it.
+		healCtx = logger.SetReqInfo(ctx, newReqInfo)
+	}
 
 	// Healing directories handle it separately.
 	if HasSuffix(object, SlashSeparator) {

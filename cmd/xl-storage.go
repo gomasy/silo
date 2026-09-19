@@ -1719,7 +1719,9 @@ func (s *xlStorage) ReadVersion(ctx context.Context, origvolume, volume, path, v
 		defer metaDataPoolPut(buf)
 	}
 
-	if readData {
+	// Delete markers have no payload. In particular, do not manufacture an
+	// inline-data metadata key when healing their zero-size FileInfo.
+	if readData && !fi.Deleted {
 		if len(fi.Data) > 0 || fi.Size == 0 {
 			if fi.InlineData() {
 				// If written with header we are fine.

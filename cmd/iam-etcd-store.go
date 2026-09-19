@@ -26,7 +26,6 @@ import (
 	"sync"
 	"time"
 
-	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/kms"
@@ -62,6 +61,7 @@ type IAMEtcdStore struct {
 	sync.RWMutex
 
 	*iamCache
+	index iamRevisionIndex
 
 	usersSysType UsersSysType
 
@@ -69,12 +69,16 @@ type IAMEtcdStore struct {
 }
 
 func newIAMEtcdStore(client *etcd.Client, usersSysType UsersSysType) *IAMEtcdStore {
-	return &IAMEtcdStore{
+	store := &IAMEtcdStore{
 		iamCache:     newIamCache(),
 		client:       client,
 		usersSysType: usersSysType,
 	}
+	store.revisions = &store.index
+	return store
 }
+
+func (ies *IAMEtcdStore) revisionIndex() *iamRevisionIndex { return &ies.index }
 
 func (ies *IAMEtcdStore) rlock() *iamCache {
 	ies.RLock()
@@ -103,6 +107,7 @@ func (ies *IAMEtcdStore) saveIAMConfig(ctx context.Context, item any, itemPath s
 	if err != nil {
 		return err
 	}
+	plain := data
 	if GlobalKMS != nil {
 		data, err = config.EncryptBytes(GlobalKMS, data, kms.Context{
 			minioMetaBucket: path.Join(minioMetaBucket, itemPath),
@@ -111,24 +116,28 @@ func (ies *IAMEtcdStore) saveIAMConfig(ctx context.Context, item any, itemPath s
 			return err
 		}
 	}
-	return saveKeyEtcd(ctx, ies.client, itemPath, data, opts...)
+	if err := saveKeyEtcd(ctx, ies.client, itemPath, data, opts...); err != nil {
+		return err
+	}
+	ies.index.observe(itemPath, plain)
+	return nil
 }
 
-func getIAMConfig(item any, data []byte, itemPath string) error {
-	data, err := decryptData(data, itemPath)
+func (ies *IAMEtcdStore) decodeIAMConfig(item any, data []byte, path string) error {
+	data, err := decryptData(data, path)
 	if err != nil {
 		return err
 	}
-	json := jsoniter.ConfigCompatibleWithStandardLibrary
+	ies.index.observe(path, data)
 	return json.Unmarshal(data, item)
 }
 
 func (ies *IAMEtcdStore) loadIAMConfig(ctx context.Context, item any, path string) error {
-	data, err := readKeyEtcd(ctx, ies.client, path)
+	data, err := ies.loadIAMConfigBytes(ctx, path)
 	if err != nil {
 		return err
 	}
-	return getIAMConfig(item, data, path)
+	return json.Unmarshal(data, item)
 }
 
 func (ies *IAMEtcdStore) loadIAMConfigBytes(ctx context.Context, path string) ([]byte, error) {
@@ -136,11 +145,19 @@ func (ies *IAMEtcdStore) loadIAMConfigBytes(ctx context.Context, path string) ([
 	if err != nil {
 		return nil, err
 	}
-	return decryptData(data, path)
+	data, err = decryptData(data, path)
+	if err == nil {
+		ies.index.observe(path, data)
+	}
+	return data, err
 }
 
 func (ies *IAMEtcdStore) deleteIAMConfig(ctx context.Context, path string) error {
-	return deleteKeyEtcd(ctx, ies.client, path)
+	if err := deleteKeyEtcd(ctx, ies.client, path); err != nil {
+		return err
+	}
+	ies.index.forget(path)
+	return nil
 }
 
 func (ies *IAMEtcdStore) loadPolicyDocWithRetry(ctx context.Context, policy string, m map[string]PolicyDoc, _ int) error {
@@ -162,6 +179,9 @@ func (ies *IAMEtcdStore) loadPolicyDoc(ctx context.Context, policy string, m map
 		return err
 	}
 
+	if p.Deleted {
+		return errNoSuchPolicy
+	}
 	m[policy] = p
 	return nil
 }
@@ -181,7 +201,11 @@ func (ies *IAMEtcdStore) getPolicyDocKV(ctx context.Context, kvs *mvccpb.KeyValu
 		return err
 	}
 
+	ies.index.observe(string(kvs.Key), data)
 	policy := extractPathPrefixAndSuffix(string(kvs.Key), iamConfigPoliciesPrefix, path.Base(string(kvs.Key)))
+	if p.Deleted {
+		return errNoSuchPolicy
+	}
 	m[policy] = p
 	return nil
 }
@@ -207,7 +231,7 @@ func (ies *IAMEtcdStore) loadPolicyDocs(ctx context.Context, m map[string]Policy
 
 func (ies *IAMEtcdStore) getUserKV(ctx context.Context, userkv *mvccpb.KeyValue, userType IAMUserType, m map[string]UserIdentity, basePrefix string) error {
 	var u UserIdentity
-	err := getIAMConfig(&u, userkv.Value, string(userkv.Key))
+	err := ies.decodeIAMConfig(&u, userkv.Value, string(userkv.Key))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchUser
@@ -219,10 +243,14 @@ func (ies *IAMEtcdStore) getUserKV(ctx context.Context, userkv *mvccpb.KeyValue,
 }
 
 func (ies *IAMEtcdStore) addUser(ctx context.Context, user string, userType IAMUserType, u UserIdentity, m map[string]UserIdentity) error {
+	if u.Deleted {
+		if userType == stsUser && !u.ExpiresAt.IsZero() && UTCNow().After(u.ExpiresAt) {
+			bestEffortIAMExpiration(ctx, ies, getUserIdentityPath(user, userType))
+		}
+		return errNoSuchUser
+	}
 	if u.Credentials.IsExpired() {
-		// Delete expired identity.
-		deleteKeyEtcd(ctx, ies.client, getUserIdentityPath(user, userType))
-		deleteKeyEtcd(ctx, ies.client, getMappedPolicyPath(user, userType, false))
+		bestEffortIAMExpiration(ctx, ies, getUserIdentityPath(user, userType))
 		return nil
 	}
 	if u.Credentials.AccessKey == "" {
@@ -231,15 +259,16 @@ func (ies *IAMEtcdStore) addUser(ctx context.Context, user string, userType IAMU
 	if u.Credentials.SessionToken != "" {
 		jwtClaims, err := extractJWTClaims(u)
 		if err != nil {
-			if u.Credentials.IsTemp() {
-				// We should delete such that the client can re-request
-				// for the expiring credentials.
-				deleteKeyEtcd(ctx, ies.client, getUserIdentityPath(user, userType))
-				deleteKeyEtcd(ctx, ies.client, getMappedPolicyPath(user, userType, false))
-			}
+			// A temporarily unavailable signing key is not proof of expiration.
 			return nil
 		}
 		u.Credentials.Claims = jwtClaims.Map()
+	}
+	if err := checkIAMParentRevision(ctx, ies, u.Credentials); err != nil {
+		if errors.Is(err, errIAMStaleUpdate) {
+			return errNoSuchUser
+		}
+		return err
 	}
 	if u.Credentials.Description == "" {
 		u.Credentials.Description = u.Credentials.Comment
@@ -258,6 +287,9 @@ func (ies *IAMEtcdStore) loadSecretKey(ctx context.Context, user string, userTyp
 		}
 		return "", err
 	}
+	if u.Deleted {
+		return "", errNoSuchUser
+	}
 	return u.Credentials.SecretKey, nil
 }
 
@@ -274,6 +306,7 @@ func (ies *IAMEtcdStore) loadUser(ctx context.Context, user string, userType IAM
 }
 
 func (ies *IAMEtcdStore) loadUsers(ctx context.Context, userType IAMUserType, m map[string]UserIdentity) error {
+	ctx = withIAMExpirationCleanup(ctx)
 	var basePrefix string
 	switch userType {
 	case svcUser:
@@ -312,6 +345,9 @@ func (ies *IAMEtcdStore) loadGroup(ctx context.Context, group string, m map[stri
 		}
 		return err
 	}
+	if gi.Deleted {
+		return errNoSuchGroup
+	}
 	m[group] = gi
 	return nil
 }
@@ -349,13 +385,16 @@ func (ies *IAMEtcdStore) loadMappedPolicy(ctx context.Context, name string, user
 		}
 		return err
 	}
+	if !ies.index.mappingAllowed(getMappedPolicyPath(name, userType, isGroup), p) {
+		return errNoSuchPolicy
+	}
 	m.Store(name, p)
 	return nil
 }
 
-func getMappedPolicy(kv *mvccpb.KeyValue, m *xsync.MapOf[string, MappedPolicy], basePrefix string) error {
+func (ies *IAMEtcdStore) getMappedPolicy(kv *mvccpb.KeyValue, m *xsync.MapOf[string, MappedPolicy], basePrefix string) error {
 	var p MappedPolicy
-	err := getIAMConfig(&p, kv.Value, string(kv.Key))
+	err := ies.decodeIAMConfig(&p, kv.Value, string(kv.Key))
 	if err != nil {
 		if err == errConfigNotFound {
 			return errNoSuchPolicy
@@ -363,6 +402,9 @@ func getMappedPolicy(kv *mvccpb.KeyValue, m *xsync.MapOf[string, MappedPolicy], 
 		return err
 	}
 	name := extractPathPrefixAndSuffix(string(kv.Key), basePrefix, ".json")
+	if !ies.index.mappingAllowed(string(kv.Key), p) {
+		return errNoSuchPolicy
+	}
 	m.Store(name, p)
 	return nil
 }
@@ -392,59 +434,11 @@ func (ies *IAMEtcdStore) loadMappedPolicies(ctx context.Context, userType IAMUse
 
 	// Parse all policies mapping to create the proper data model
 	for _, kv := range r.Kvs {
-		if err = getMappedPolicy(kv, m, basePrefix); err != nil && !errors.Is(err, errNoSuchPolicy) {
+		if err = ies.getMappedPolicy(kv, m, basePrefix); err != nil && !errors.Is(err, errNoSuchPolicy) {
 			return err
 		}
 	}
 	return nil
-}
-
-func (ies *IAMEtcdStore) savePolicyDoc(ctx context.Context, policyName string, p PolicyDoc) error {
-	return ies.saveIAMConfig(ctx, &p, getPolicyDocPath(policyName))
-}
-
-func (ies *IAMEtcdStore) saveMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, mp MappedPolicy, opts ...options) error {
-	return ies.saveIAMConfig(ctx, mp, getMappedPolicyPath(name, userType, isGroup), opts...)
-}
-
-func (ies *IAMEtcdStore) saveUserIdentity(ctx context.Context, name string, userType IAMUserType, u UserIdentity, opts ...options) error {
-	return ies.saveIAMConfig(ctx, u, getUserIdentityPath(name, userType), opts...)
-}
-
-func (ies *IAMEtcdStore) saveGroupInfo(ctx context.Context, name string, gi GroupInfo) error {
-	return ies.saveIAMConfig(ctx, gi, getGroupInfoPath(name))
-}
-
-func (ies *IAMEtcdStore) deletePolicyDoc(ctx context.Context, name string) error {
-	err := ies.deleteIAMConfig(ctx, getPolicyDocPath(name))
-	if err == errConfigNotFound {
-		err = errNoSuchPolicy
-	}
-	return err
-}
-
-func (ies *IAMEtcdStore) deleteMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool) error {
-	err := ies.deleteIAMConfig(ctx, getMappedPolicyPath(name, userType, isGroup))
-	if err == errConfigNotFound {
-		err = errNoSuchPolicy
-	}
-	return err
-}
-
-func (ies *IAMEtcdStore) deleteUserIdentity(ctx context.Context, name string, userType IAMUserType) error {
-	err := ies.deleteIAMConfig(ctx, getUserIdentityPath(name, userType))
-	if err == errConfigNotFound {
-		err = errNoSuchUser
-	}
-	return err
-}
-
-func (ies *IAMEtcdStore) deleteGroupInfo(ctx context.Context, name string) error {
-	err := ies.deleteIAMConfig(ctx, getGroupInfoPath(name))
-	if err == errConfigNotFound {
-		err = errNoSuchGroup
-	}
-	return err
 }
 
 func (ies *IAMEtcdStore) watch(ctx context.Context, keyPath string) <-chan iamWatchEvent {

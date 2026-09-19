@@ -1,5 +1,7 @@
 # Compression Guide
 
+For SILO's current SSE-C compression and historical-object boundary, see the [maintained encryption guide](https://silo.pgsty.com/administration/server-side-encryption/server-side-encryption-sse-c/) and [SSE-C replica design](https://silo.pgsty.com/blog/design/ssec-replica-integrity/). Check the documented release boundary before applying main-branch behavior to an older binary.
+
 Silo server allows streaming compression to ensure efficient disk space usage.
 Compression happens inflight, i.e objects are compressed before being written to disk(s).
 Silo uses [`klauspost/compress/s2`](https://github.com/klauspost/compress/tree/master/s2)
@@ -85,6 +87,13 @@ To enable compression+encryption use:
 ```
 
 Or alternatively through the environment variable `MINIO_COMPRESSION_ALLOW_ENCRYPTION=on`.
+
+SSE-C objects are excluded from compression even with `allow_encryption=on`.
+Replication ships an SSE-C object as raw ciphertext, because the server never holds the
+customer key, and the compression metadata is not carried over the wire. A compressed
+SSE-C object would therefore replicate to a replica that decrypts to a compressed stream.
+`allow_encryption` still applies to SSE-S3 and SSE-KMS, where the server owns the key and
+decompresses before replicating.
 
 ### 4. Excluded Types
 

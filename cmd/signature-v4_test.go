@@ -313,3 +313,44 @@ func TestDoesPresignedSignatureMatch(t *testing.T) {
 		}
 	}
 }
+
+// TestPresignedVerifyIdempotent guards against a regression where verifying the
+// same presigned request twice began to fail. The verifier must not write
+// anything back to the request (it once recorded an internal
+// x-amz-signature-age header that the unsigned-header check then had to
+// exempt), and an unsigned x-amz-content-sha256 the client may carry stays
+// exempt, so a second verification of the same *http.Request still succeeds.
+func TestPresignedVerifyIdempotent(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	obj, fsDir, err := prepareFS(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := newTestRequest(http.MethodGet, "http://127.0.0.1:9000/bucket/object", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = preSignV4(req, globalActiveCred.AccessKey, globalActiveCred.SecretKey, int64(10*60)); err != nil {
+		t.Fatal(err)
+	}
+	if err = req.ParseForm(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := reqSignatureV4Verify(req, globalSite.Region(), serviceS3); got != ErrNone {
+		t.Fatalf("first verification: expected ErrNone, got %s", niceError(got))
+	}
+	if got := reqSignatureV4Verify(req, globalSite.Region(), serviceS3); got != ErrNone {
+		t.Fatalf("second verification of the same request: expected ErrNone, got %s", niceError(got))
+	}
+	if _, ok := req.Header["X-Amz-Signature-Age"]; ok {
+		t.Fatal("the verifier wrote a scratch header back to the request")
+	}
+}

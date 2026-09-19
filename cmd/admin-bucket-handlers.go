@@ -76,7 +76,7 @@ func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	quotaConfig, err := parseBucketQuota(bucket, data)
+	_, err = parseBucketQuota(bucket, data)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -93,9 +93,6 @@ func (a adminAPIHandlers) PutBucketQuotaConfigHandler(w http.ResponseWriter, r *
 		Bucket:    bucket,
 		Quota:     data,
 		UpdatedAt: updatedAt,
-	}
-	if quotaConfig.Size == 0 && quotaConfig.Quota == 0 {
-		bucketMeta.Quota = nil
 	}
 
 	// Call site replication hook.
@@ -417,6 +414,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 		bucketLifecycleConfig,
 		bucketSSEConfig,
 		bucketTaggingConfig,
+		bucketCorsConfig,
 		bucketQuotaConfigFile,
 		objectLockConfig,
 		bucketVersioningConfig,
@@ -437,7 +435,7 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
-				configData, err := json.Marshal(config)
+				configData, err := canonicalBucketPolicy(config)
 				if err != nil {
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
@@ -513,6 +511,19 @@ func (a adminAPIHandlers) ExportBucketMetadataHandler(w http.ResponseWriter, r *
 				}
 				configData, err := xml.Marshal(config)
 				if err != nil {
+					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
+					return
+				}
+				rawDataFn(bytes.NewReader(configData), cfgPath, len(configData))
+			case bucketCorsConfig:
+				// Export the stored document verbatim: GetBucketCors returns
+				// the bytes exactly as they were PUT, so the archive must
+				// round-trip them unchanged.
+				configData, _, err := globalBucketMetadataSys.GetCorsConfigXML(bucket)
+				if err != nil {
+					if errors.Is(err, errConfigNotFound) {
+						continue
+					}
 					writeErrorResponse(ctx, w, exportError(ctx, err, cfgFile, bucket), r.URL)
 					return
 				}
@@ -616,6 +627,13 @@ func applyImportedBucketMetadata(dst *BucketMetadata, src BucketMetadata, fields
 		case bucketQuotaConfigFile:
 			dst.QuotaConfigJSON = bytes.Clone(src.QuotaConfigJSON)
 			dst.QuotaConfigUpdatedAt = src.QuotaConfigUpdatedAt
+		case bucketCorsConfig:
+			// The import stamps its fields before creating any missing bucket,
+			// and a CORS event stamped before bucket creation is discarded as
+			// belonging to an older incarnation, so the imported document takes
+			// the same monotonic timestamp a local PutBucketCors would assign.
+			dst.CorsConfigUpdatedAt = localCORSUpdatedAt(*dst, src.CorsConfigUpdatedAt)
+			dst.CorsConfigXML = bytes.Clone(src.CorsConfigXML)
 		case objectLockConfig:
 			dst.ObjectLockConfigXML = bytes.Clone(src.ObjectLockConfigXML)
 			dst.ObjectLockConfigUpdatedAt = src.ObjectLockConfigUpdatedAt
@@ -645,6 +663,8 @@ func (i *importMetaReport) SetStatus(bucket, fname string, err error) {
 		st.Tagging = madmin.MetaStatus{IsSet: true, Err: errMsg}
 	case bucketQuotaConfigFile:
 		st.Quota = madmin.MetaStatus{IsSet: true, Err: errMsg}
+	case bucketCorsConfig:
+		st.Cors = madmin.MetaStatus{IsSet: true, Err: errMsg}
 	case objectLockConfig:
 		st.ObjectLock = madmin.MetaStatus{IsSet: true, Err: errMsg}
 	case bucketVersioningConfig:
@@ -899,7 +919,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 				continue
 			}
 
-			configData, err := json.Marshal(bucketPolicy)
+			configData, err := canonicalBucketPolicy(bucketPolicy)
 			if err != nil {
 				rpt.SetStatus(bucket, fileName, err)
 				continue
@@ -1015,6 +1035,32 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 			bucketMap[bucket].QuotaConfigUpdatedAt = updatedAt
 			markImported(bucket, fileName)
 			rpt.SetStatus(bucket, fileName, nil)
+		case bucketCorsConfig:
+			if sz > maxBucketCorsSize {
+				rpt.SetStatus(bucket, fileName, errors.New(ErrEntityTooLarge.String()))
+				continue
+			}
+
+			// Read one byte past the declared size: stopping exactly at sz
+			// leaves archive/zip short of EOF, so it never verifies the entry
+			// checksum and a corrupt entry carrying well formed XML would be
+			// stored as a valid document. The extra byte also lets the reader
+			// reject an entry longer than it declares.
+			corsData, err := io.ReadAll(io.LimitReader(reader, sz+1))
+			if err != nil {
+				rpt.SetStatus(bucket, fileName, err)
+				continue
+			}
+
+			if err = validateCORSReplicationPayload(corsData); err != nil {
+				rpt.SetStatus(bucket, fileName, fmt.Errorf("%s (%s)", errorCodes[ErrMalformedXML].Description, err))
+				continue
+			}
+
+			bucketMap[bucket].CorsConfigXML = corsData
+			bucketMap[bucket].CorsConfigUpdatedAt = updatedAt
+			markImported(bucket, fileName)
+			rpt.SetStatus(bucket, fileName, nil)
 		}
 	}
 
@@ -1032,18 +1078,39 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 			continue
 		}
 		var merged BucketMetadata
+		var commitAt time.Time
 		err := func() error {
 			lockCtx, unlock, err := lockBucketMetadata(ctx, objectAPI, bucket)
 			if err != nil {
 				return err
 			}
 			defer unlock()
-			merged, err = loadBucketMetadataParse(lockCtx, objectAPI, bucket, true)
+			merged, err = loadBucketMetadataParse(lockCtx, objectAPI, bucket, false)
 			if err != nil {
 				return err
 			}
+			if err := ensureBucketMetadataCreated(lockCtx, objectAPI, &merged); err != nil {
+				return err
+			}
+			commitAt = UTCNow()
+			for _, file := range replicatedBucketConfigs {
+				if _, ok := fields[file]; ok {
+					commitAt = localBucketConfigUpdatedAt(merged, file, commitAt)
+				}
+			}
 			applyImportedBucketMetadata(&merged, *meta, fields)
-			return globalBucketMetadataSys.saveMetadata(lockCtx, objectAPI, merged)
+			for _, file := range replicatedBucketConfigs {
+				if _, ok := fields[file]; !ok {
+					continue
+				}
+				data, at := replicatedBucketConfig(&merged, file)
+				payload, _, err := bucketConfigPayload(bucket, file, *data, len(merged.ObjectLockConfigXML) != 0)
+				if err != nil {
+					return err
+				}
+				*data, *at = payload, commitAt
+			}
+			return globalBucketMetadataSys.saveMetadata(lockCtx, objectAPI, &merged)
 		}()
 		if err != nil {
 			rpt.SetStatus(bucket, "", err)
@@ -1051,7 +1118,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 		}
 		*meta = merged
 		globalNotificationSys.LoadBucketMetadata(bgContext(ctx), bucket)
-		hook := madmin.SRBucketMeta{Bucket: bucket, UpdatedAt: updatedAt}
+		hook := madmin.SRBucketMeta{Bucket: bucket, UpdatedAt: commitAt}
 		var hookNeeded bool
 		if _, ok := fields[bucketQuotaConfigFile]; ok {
 			hook.Quota = meta.QuotaConfigJSON
@@ -1059,7 +1126,7 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 		}
 		if _, ok := fields[bucketPolicyConfig]; ok {
 			hook.Policy = meta.PolicyConfigJSON
-			hookNeeded = true
+			hookNeeded = hookNeeded || len(hook.Policy) != 0
 		}
 		if _, ok := fields[bucketVersioningConfig]; ok {
 			hook.Versioning = enc(meta.VersioningConfigXML)
@@ -1079,6 +1146,22 @@ func (a adminAPIHandlers) ImportBucketMetadataHandler(w http.ResponseWriter, r *
 		}
 		if hookNeeded {
 			err = globalSiteReplicationSys.BucketMetaHook(ctx, hook)
+		}
+		if _, ok := fields[bucketPolicyConfig]; ok && len(meta.PolicyConfigJSON) == 0 {
+			// An omitted bulk Policy cannot express deletion.
+			err = errors.Join(err, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
+				Type: madmin.SRBucketMetaTypePolicy, Bucket: bucket, UpdatedAt: commitAt,
+			}))
+		}
+		if _, ok := fields[bucketCorsConfig]; ok {
+			// CORS carries its own timestamp, so it replicates through the
+			// dedicated event rather than the shared bucket metadata hook. It
+			// is announced even when the shared hook failed: the document is
+			// already committed locally, and a peer that is unreachable for
+			// one config must not withhold CORS from the reachable ones.
+			if corsEvent, live := newBucketCORSReplicationEvent(bucket, *meta); live {
+				err = errors.Join(err, globalSiteReplicationSys.BucketMetaHook(ctx, corsEvent))
+			}
 		}
 		if err != nil {
 			rpt.SetStatus(bucket, "", err)

@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"bytes"
-	"encoding/json"
 	"io"
 	"net/http"
 
@@ -100,13 +99,13 @@ func (api objectAPIHandlers) PutBucketPolicyHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	configData, err := json.Marshal(bucketPolicy)
+	configData, err := canonicalBucketPolicy(bucketPolicy)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
-	updatedAt, err := globalBucketMetadataSys.Update(ctx, bucket, bucketPolicyConfig, configData)
+	result, err := globalBucketMetadataSys.updateAndParseMetadata(ctx, bucket, bucketPolicyConfig, configData, false, false, nil)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -116,8 +115,8 @@ func (api objectAPIHandlers) PutBucketPolicyHandler(w http.ResponseWriter, r *ht
 	replLogIf(ctx, globalSiteReplicationSys.BucketMetaHook(ctx, madmin.SRBucketMeta{
 		Type:      madmin.SRBucketMetaTypePolicy,
 		Bucket:    bucket,
-		Policy:    bucketPolicyBytes,
-		UpdatedAt: updatedAt,
+		Policy:    result.meta.PolicyConfigJSON,
+		UpdatedAt: result.updatedAt,
 	}))
 
 	// Success.
@@ -200,7 +199,7 @@ func (api objectAPIHandlers) GetBucketPolicyHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	configData, err := json.Marshal(config)
+	configData, err := canonicalBucketPolicy(config)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return

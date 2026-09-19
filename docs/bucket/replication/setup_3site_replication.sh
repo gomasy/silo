@@ -37,7 +37,7 @@ set -e
 export MINIO_CI_CD=1
 export MINIO_BROWSER=off
 export MINIO_ROOT_USER="minio"
-export MINIO_ROOT_PASSWORD="silo123"
+export MINIO_ROOT_PASSWORD="silo12345"
 export MINIO_KMS_AUTO_ENCRYPTION=off
 export MINIO_PROMETHEUS_AUTH_TYPE=public
 export MINIO_KMS_SECRET_KEY=my-minio-key:OSMM+vkKUTCvQs9YL/CVMIMt43HFhkUpqJxTmGl6rYw=
@@ -70,9 +70,9 @@ silo server --address 127.0.0.1:9005 "http://127.0.0.1:9005/tmp/multisitec/data/
 silo server --address 127.0.0.1:9006 "http://127.0.0.1:9005/tmp/multisitec/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9006/tmp/multisitec/data/disterasure/xl{5...8}" >/tmp/sitec_2.log 2>&1 &
 
-export MC_HOST_sitea=http://minio:silo123@127.0.0.1:9001
-export MC_HOST_siteb=http://minio:silo123@127.0.0.1:9004
-export MC_HOST_sitec=http://minio:silo123@127.0.0.1:9006
+export MC_HOST_sitea=http://minio:silo12345@127.0.0.1:9001
+export MC_HOST_siteb=http://minio:silo12345@127.0.0.1:9004
+export MC_HOST_sitec=http://minio:silo12345@127.0.0.1:9006
 
 ./mc ready sitea
 ./mc ready siteb
@@ -93,73 +93,73 @@ export MC_HOST_sitec=http://minio:silo123@127.0.0.1:9006
 echo "adding replication rule for a -> b : ${remote_arn}"
 sleep 1
 ./mc replicate add sitea/bucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9004/bucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9004/bucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync"
 sleep 1
 
 echo "adding replication rule for b -> a : ${remote_arn}"
 ./mc replicate add siteb/bucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9001/bucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9001/bucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync"
 sleep 1
 
 echo "adding replication rule for a -> c : ${remote_arn}"
 ./mc replicate add sitea/bucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9006/bucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9006/bucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync" --priority 2
 sleep 1
 
 echo "adding replication rule for c -> a : ${remote_arn}"
 ./mc replicate add sitec/bucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9001/bucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9001/bucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync" --priority 2
 sleep 1
 
 echo "adding replication rule for b -> c : ${remote_arn}"
 ./mc replicate add siteb/bucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9006/bucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9006/bucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync" --priority 3
 sleep 1
 
 echo "adding replication rule for c -> b : ${remote_arn}"
 ./mc replicate add sitec/bucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9004/bucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9004/bucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync" --priority 3
 sleep 1
 
 echo "adding replication rule for olockbucket a -> b : ${remote_arn}"
 ./mc replicate add sitea/olockbucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9004/olockbucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9004/olockbucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync"
 sleep 1
 
 echo "adding replication rule for olockbucket b -> a : ${remote_arn}"
 ./mc replicate add siteb/olockbucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9001/olockbucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9001/olockbucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync"
 sleep 1
 
 echo "adding replication rule for olockbucket a -> c : ${remote_arn}"
 ./mc replicate add sitea/olockbucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9006/olockbucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9006/olockbucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync" --priority 2
 sleep 1
 
 echo "adding replication rule for olockbucket c -> a : ${remote_arn}"
 ./mc replicate add sitec/olockbucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9001/olockbucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9001/olockbucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync" --priority 2
 sleep 1
 
 echo "adding replication rule for olockbucket b -> c : ${remote_arn}"
 ./mc replicate add siteb/olockbucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9006/olockbucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9006/olockbucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync" --priority 3
 sleep 1
 
 echo "adding replication rule for olockbucket c -> b : ${remote_arn}"
 ./mc replicate add sitec/olockbucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9004/olockbucket \
+	--remote-bucket http://minio:silo12345@127.0.0.1:9004/olockbucket \
 	--replicate "existing-objects,delete,delete-marker,replica-metadata-sync" --priority 3
 sleep 1
 
@@ -204,33 +204,33 @@ head -c 221227088 </dev/urandom >200M
 sleep 10
 
 echo "Verifying ETag for all objects"
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9001/ -bucket bucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9002/ -bucket bucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9003/ -bucket bucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9004/ -bucket bucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9005/ -bucket bucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9006/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9001/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9002/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9003/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9004/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9005/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9006/ -bucket bucket
 
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9001/ -bucket olockbucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9002/ -bucket olockbucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9003/ -bucket olockbucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9004/ -bucket olockbucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9005/ -bucket olockbucket
-./s3-check-md5 -versions -access-key minio -secret-key silo123 -endpoint http://127.0.0.1:9006/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9001/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9002/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9003/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9004/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9005/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key silo12345 -endpoint http://127.0.0.1:9006/ -bucket olockbucket
 
 # additional tests for encryption object alignment
 go install -v github.com/minio/multipart-debug@latest
 
-upload_id=$(multipart-debug --endpoint 127.0.0.1:9001 --accesskey minio --secretkey silo123 multipart new --bucket bucket --object new-test-encrypted-object --encrypt)
+upload_id=$(multipart-debug --endpoint 127.0.0.1:9001 --accesskey minio --secretkey silo12345 multipart new --bucket bucket --object new-test-encrypted-object --encrypt)
 
 dd if=/dev/urandom bs=1 count=7048531 of=/tmp/7048531.txt
 dd if=/dev/urandom bs=1 count=2847391 of=/tmp/2847391.txt
 
 sudo apt install jq -y
 
-etag_1=$(multipart-debug --endpoint 127.0.0.1:9002 --accesskey minio --secretkey silo123 multipart upload --bucket bucket --object new-test-encrypted-object --uploadid ${upload_id} --file /tmp/7048531.txt --number 1 | jq -r .ETag)
-etag_2=$(multipart-debug --endpoint 127.0.0.1:9001 --accesskey minio --secretkey silo123 multipart upload --bucket bucket --object new-test-encrypted-object --uploadid ${upload_id} --file /tmp/2847391.txt --number 2 | jq -r .ETag)
-multipart-debug --endpoint 127.0.0.1:9002 --accesskey minio --secretkey silo123 multipart complete --bucket bucket --object new-test-encrypted-object --uploadid ${upload_id} 1.${etag_1} 2.${etag_2}
+etag_1=$(multipart-debug --endpoint 127.0.0.1:9002 --accesskey minio --secretkey silo12345 multipart upload --bucket bucket --object new-test-encrypted-object --uploadid ${upload_id} --file /tmp/7048531.txt --number 1 | jq -r .ETag)
+etag_2=$(multipart-debug --endpoint 127.0.0.1:9001 --accesskey minio --secretkey silo12345 multipart upload --bucket bucket --object new-test-encrypted-object --uploadid ${upload_id} --file /tmp/2847391.txt --number 2 | jq -r .ETag)
+multipart-debug --endpoint 127.0.0.1:9002 --accesskey minio --secretkey silo12345 multipart complete --bucket bucket --object new-test-encrypted-object --uploadid ${upload_id} 1.${etag_1} 2.${etag_2}
 
 sleep 10
 

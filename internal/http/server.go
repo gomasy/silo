@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/minio/internal/deadlineconn"
 )
 
 var (
@@ -122,6 +123,32 @@ func (srv *Server) Init(listenCtx context.Context, listenErrCallback func(listen
 	srv.Handler = wrappedHandler
 	srv.listener = listener
 	srv.listenerMutex.Unlock()
+
+	connState := srv.ConnState
+	srv.ConnState = func(conn net.Conn, state http.ConnState) {
+		raw := conn
+		if tlsConn, ok := raw.(*tls.Conn); ok {
+			if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+				// HTTP/2 owns its stream deadlines; do not change the connection.
+				raw = nil
+			} else {
+				raw = tlsConn.NetConn()
+			}
+		}
+		if dc, ok := raw.(*deadlineconn.DeadlineConn); ok {
+			switch state {
+			case http.StateNew, http.StateIdle:
+				dc.SetReadDeadlineStrict(true)
+			case http.StateActive:
+				// net/http has finished reading the headers, including buffered
+				// requests. Keep ReadTimeout as a rolling idle limit for uploads.
+				dc.SetReadDeadlineStrict(false)
+			}
+		}
+		if connState != nil {
+			connState(conn, state)
+		}
+	}
 
 	var l net.Listener = listener
 	if tlsConfig != nil {

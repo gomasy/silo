@@ -132,6 +132,8 @@ For deployments with [bucket](https://silo.pgsty.com/administration/bucket-repli
 | `minio_node_replication_max_queued_bytes`               | Maximum number of bytes queued for replication seen since server start                                   |
 | `minio_node_replication_max_queued_count`               | Maximum number of objects queued for replication seen since server start                                 |
 | `minio_node_replication_recent_backlog_count`           | Total number of objects seen in replication backlog in the last 5 minutes                                |
+| `minio_node_replication_mrf_dropped_operations_total` | Cumulative MRF entries dropped due to queue capacity or retry exhaustion; may count the same object more than once. Scanner repair remains available. |
+| `minio_node_replication_mrf_dropped_bytes_total` | Cumulative known bytes of dropped MRF entries; delete entries count as zero bytes. |
 
 ## Healing Metrics
 

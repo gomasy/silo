@@ -166,7 +166,6 @@ func LookupConfig(kvs config.KVS, rootCAs *x509.CertPool) (Config, error) {
 			NextProtos:               []string{"http/1.1", "h2"},
 			ClientSessionCache:       tls.NewLRUClientSessionCache(64),
 			CipherSuites:             crypto.TLSCiphersBackwardCompatible(),
-			CurvePreferences:         crypto.TLSCurveIDs(),
 		}
 		// This is only to support client side certificate authentication
 		// https://coreos.com/etcd/docs/latest/op-guide/security.html

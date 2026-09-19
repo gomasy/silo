@@ -418,8 +418,14 @@ func checkReplicateDelete(ctx context.Context, bucket string, dobj ObjectToDelet
 // target cluster, the object version is marked deleted on the source and hidden from listing. It is permanently
 // deleted from the source when the VersionPurgeStatus changes to "Complete", i.e after replication succeeds
 // on target.
-func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, objectAPI ObjectLayer) {
+// replicateDelete replicates a delete (delete marker or version purge) to all
+// applicable targets and returns the per-target replication outcome. Callers
+// that only trigger replication may ignore the return value; the resync path
+// uses it to classify success/failure per target rather than inferring it from
+// the mere presence or absence of the target version.
+func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, objectAPI ObjectLayer) replicatedInfos {
 	var replicationStatus replication.StatusType
+	isPurge := dobj.isVersionPurge()
 	bucket := dobj.Bucket
 	versionID := dobj.DeleteMarkerVersionID
 	if versionID == "" {
@@ -453,7 +459,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 			Host:      globalLocalNodeName,
 			EventName: event.ObjectReplicationNotTracked,
 		})
-		return
+		return replicatedInfos{}
 	}
 	dsc, err := parseReplicateDecision(ctx, bucket, dobj.ReplicationState.ReplicateDecisionStr)
 	if err != nil {
@@ -471,7 +477,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 			Host:      globalLocalNodeName,
 			EventName: event.ObjectReplicationNotTracked,
 		})
-		return
+		return replicatedInfos{}
 	}
 
 	// Lock the object name before starting replication operation.
@@ -479,6 +485,7 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 	lk := objectAPI.NewNSLock(bucket, "/[replicate]/"+dobj.ObjectName)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
+		dobj.RetryCount++
 		globalReplicationPool.Get().queueMRFSave(dobj.ToMRFEntry())
 		sendEvent(eventArgs{
 			BucketName: bucket,
@@ -492,10 +499,39 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 			Host:      globalLocalNodeName,
 			EventName: event.ObjectReplicationNotTracked,
 		})
-		return
+		return replicatedInfos{}
 	}
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx)
+
+	if !isPurge && dobj.DeleteMarkerVersionID != "" {
+		// A creation task carries the marker as it looked when it was queued
+		// by the DELETE handler, a GET/HEAD/LIST heal, the scanner or MRF.
+		// While it waited for this lock, another frontend may have purged the
+		// marker and replicated that purge. The targets no longer hold the
+		// marker, so the queued creation would recreate it from the stale
+		// snapshot. Confirm the source version under the lock first.
+		switch deleteMarkerCreationState(ctx, objectAPI, dobj) {
+		case creationStale:
+			return replicatedInfos{}
+		case creationUnverified:
+			dobj.RetryCount++
+			globalReplicationPool.Get().queueMRFSave(dobj.ToMRFEntry())
+			sendEvent(eventArgs{
+				BucketName: bucket,
+				Object: ObjectInfo{
+					Bucket:       bucket,
+					Name:         dobj.ObjectName,
+					VersionID:    versionID,
+					DeleteMarker: dobj.DeleteMarker,
+				},
+				UserAgent: "Internal: [Replication]",
+				Host:      globalLocalNodeName,
+				EventName: event.ObjectReplicationNotTracked,
+			})
+			return replicatedInfos{}
+		}
+	}
 
 	rinfos := replicatedInfos{Targets: make([]replicatedTargetInfo, 0, len(dsc.targetsMap))}
 	var wg sync.WaitGroup
@@ -541,25 +577,38 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 	replicationStatus = rinfos.ReplicationStatus()
 	prevStatus := dobj.DeleteMarkerReplicationStatus()
 
-	if dobj.VersionID != "" {
-		prevStatus = replication.StatusType(dobj.VersionPurgeStatus())
-		replicationStatus = replication.StatusType(rinfos.VersionPurgeStatus())
+	if isPurge {
+		prevStatus = purgeReplicationStatus(dobj.VersionPurgeStatus())
+		replicationStatus = purgeReplicationStatus(rinfos.VersionPurgeStatus())
 	}
 
 	// to decrement pending count later.
 	for _, rinfo := range rinfos.Targets {
-		if rinfo.ReplicationStatus != rinfo.PrevReplicationStatus {
-			globalReplicationStats.Load().Update(dobj.Bucket, rinfo, replicationStatus,
-				prevStatus)
+		status, previous := rinfo.ReplicationStatus, rinfo.PrevReplicationStatus
+		if isPurge {
+			status = purgeReplicationStatus(rinfo.VersionPurgeStatus)
+			previous = purgeReplicationStatus(dobj.ReplicationState.PurgeTargets[rinfo.Arn])
+		}
+		if status != previous {
+			globalReplicationStats.Load().Update(dobj.Bucket, rinfo, status, previous)
 		}
 	}
 
 	eventName := event.ObjectReplicationComplete
 	if replicationStatus == replication.Failed {
 		eventName = event.ObjectReplicationFailed
+		dobj.RetryCount++
 		globalReplicationPool.Get().queueMRFSave(dobj.ToMRFEntry())
 	}
 	drs := getReplicationState(rinfos, dobj.ReplicationState, dobj.VersionID)
+	if isPurge {
+		// A purge must not rewrite the marker's creation/replica metadata.
+		// Multiple serialized empty target statuses can parse as nonempty,
+		// so explicitly send an empty creation update to the metadata writer.
+		drs.ReplicationStatusInternal = ""
+		drs.Targets = nil
+		drs.ReplicaStatus = ""
+	}
 	if replicationStatus != prevStatus {
 		drs.ReplicationTimeStamp = UTCNow()
 	}
@@ -597,9 +646,11 @@ func replicateDelete(ctx context.Context, dobj DeletedObjectReplicationInfo, obj
 			EventName:  eventName,
 		})
 	}
+	return rinfos
 }
 
 func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationInfo, tgt *TargetClient) (rinfo replicatedTargetInfo) {
+	isPurge := dobj.isVersionPurge()
 	versionID := dobj.DeleteMarkerVersionID
 	if versionID == "" {
 		versionID = dobj.VersionID
@@ -609,42 +660,50 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 	rinfo.OpType = dobj.OpType
 	rinfo.endpoint = tgt.EndpointURL().Host
 	rinfo.secure = tgt.EndpointURL().Scheme == "https"
+	// A purge leaves ReplicationStatus empty: the metadata writer interprets
+	// that as preserving the entire creation-status block, including targets
+	// outside this fan-out. Only VersionPurgeStatus records the purge outcome.
 	defer func() {
-		if rinfo.ReplicationStatus == replication.Completed && tgt.ResetID != "" && dobj.OpType == replication.ExistingObjectReplicationType {
+		completed := rinfo.ReplicationStatus == replication.Completed
+		if isPurge {
+			completed = rinfo.VersionPurgeStatus == replication.VersionPurgeComplete
+		}
+		if completed && tgt.ResetID != "" && dobj.OpType == replication.ExistingObjectReplicationType {
 			rinfo.ResyncTimestamp = fmt.Sprintf("%s;%s", UTCNow().Format(http.TimeFormat), tgt.ResetID)
 		}
 	}()
 
-	if dobj.VersionID == "" && rinfo.PrevReplicationStatus == replication.Completed && dobj.OpType != replication.ExistingObjectReplicationType {
+	if !isPurge && rinfo.PrevReplicationStatus == replication.Completed && dobj.OpType != replication.ExistingObjectReplicationType {
 		rinfo.ReplicationStatus = rinfo.PrevReplicationStatus
 		return rinfo
 	}
-	if dobj.VersionID != "" && rinfo.VersionPurgeStatus == replication.VersionPurgeComplete {
+	if isPurge && rinfo.VersionPurgeStatus == replication.VersionPurgeComplete {
 		return rinfo
 	}
 	if globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
-		replLogOnceIf(ctx, fmt.Errorf("remote target is offline for bucket:%s arn:%s", dobj.Bucket, tgt.ARN), "replication-target-offline-delete-"+tgt.ARN)
+		rinfo.Err = fmt.Errorf("remote target is offline for bucket:%s arn:%s", dobj.Bucket, tgt.ARN)
+		replLogOnceIf(ctx, rinfo.Err, "replication-target-offline-delete-"+tgt.ARN)
 		sendEvent(eventArgs{
 			BucketName: dobj.Bucket,
 			Object: ObjectInfo{
 				Bucket:       dobj.Bucket,
 				Name:         dobj.ObjectName,
-				VersionID:    dobj.VersionID,
+				VersionID:    versionID,
 				DeleteMarker: dobj.DeleteMarker,
 			},
 			UserAgent: "Internal: [Replication]",
 			Host:      globalLocalNodeName,
 			EventName: event.ObjectReplicationNotTracked,
 		})
-		if dobj.VersionID == "" {
-			rinfo.ReplicationStatus = replication.Failed
-		} else {
+		if isPurge {
 			rinfo.VersionPurgeStatus = replication.VersionPurgeFailed
+		} else {
+			rinfo.ReplicationStatus = replication.Failed
 		}
 		return rinfo
 	}
 	// early return if already replicated delete marker for existing object replication/ healing delete markers
-	if dobj.DeleteMarkerVersionID != "" {
+	if !isPurge && dobj.DeleteMarkerVersionID != "" {
 		toi, err := tgt.StatObject(ctx, tgt.Bucket, dobj.ObjectName, minio.StatObjectOptions{
 			VersionID: versionID,
 			Internal: minio.AdvancedGetOptions{
@@ -656,16 +715,10 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 		switch {
 		case isErrMethodNotAllowed(serr):
 			// delete marker already replicated
-			if dobj.VersionID == "" && rinfo.VersionPurgeStatus.Empty() {
-				rinfo.ReplicationStatus = replication.Completed
-				return rinfo
-			}
+			rinfo.ReplicationStatus = replication.Completed
+			return rinfo
 		case isErrObjectNotFound(serr), isErrVersionNotFound(serr):
-			// version being purged is already not found on target.
-			if !rinfo.VersionPurgeStatus.Empty() {
-				rinfo.VersionPurgeStatus = replication.VersionPurgeComplete
-				return rinfo
-			}
+			// The marker still needs to be created on the target.
 		case isErrReadQuorum(serr), isErrWriteQuorum(serr):
 			// destination has some quorum issues, perform removeObject() anyways
 			// to complete the operation.
@@ -685,7 +738,7 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 	rmErr := tgt.RemoveObject(ctx, tgt.Bucket, dobj.ObjectName, minio.RemoveObjectOptions{
 		VersionID: versionID,
 		Internal: minio.AdvancedRemoveOptions{
-			ReplicationDeleteMarker: dobj.DeleteMarkerVersionID != "",
+			ReplicationDeleteMarker: !isPurge && dobj.DeleteMarkerVersionID != "",
 			ReplicationMTime:        dobj.DeleteMarkerMTime.Time,
 			ReplicationStatus:       minio.ReplicationStatusReplica,
 			ReplicationRequest:      true, // always set this to distinguish between `mc mirror` replication and serverside
@@ -693,20 +746,20 @@ func replicateDeleteToTarget(ctx context.Context, dobj DeletedObjectReplicationI
 	})
 	if rmErr != nil {
 		rinfo.Err = rmErr
-		if dobj.VersionID == "" {
-			rinfo.ReplicationStatus = replication.Failed
-		} else {
+		if isPurge {
 			rinfo.VersionPurgeStatus = replication.VersionPurgeFailed
+		} else {
+			rinfo.ReplicationStatus = replication.Failed
 		}
 		replLogIf(ctx, fmt.Errorf("unable to replicate delete marker to %s: %s/%s(%s): %w", tgt.EndpointURL(), tgt.Bucket, dobj.ObjectName, versionID, rmErr))
 		if rmErr != nil && minio.IsNetworkOrHostDown(rmErr, true) && !globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
 			globalBucketTargetSys.markOffline(tgt.EndpointURL())
 		}
 	} else {
-		if dobj.VersionID == "" {
-			rinfo.ReplicationStatus = replication.Completed
-		} else {
+		if isPurge {
 			rinfo.VersionPurgeStatus = replication.VersionPurgeComplete
+		} else {
+			rinfo.ReplicationStatus = replication.Completed
 		}
 	}
 	return rinfo
@@ -775,9 +828,30 @@ func (m caseInsensitiveMap) Lookup(key string) (string, bool) {
 	return "", false
 }
 
+// replicationTaggingTimestamp carries a recorded removal even when tags are
+// empty. Only legacy nonempty tags use ModTime; absence is not a tombstone.
+func replicationTaggingTimestamp(objInfo ObjectInfo) (time.Time, error) {
+	if stamp, ok := caseInsensitiveMap(objInfo.UserDefined).Lookup(ReservedMetadataPrefixLower + TaggingTimestamp); ok {
+		return time.Parse(time.RFC3339Nano, stamp)
+	}
+	if objInfo.UserTags != "" {
+		return objInfo.ModTime, nil
+	}
+	return time.Time{}, nil
+}
+
 func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (putOpts minio.PutObjectOptions, isMP bool, err error) {
 	meta := make(map[string]string)
 	isSSEC := crypto.SSEC.IsEncrypted(objInfo.UserDefined)
+
+	// An SSE-C object is replicated as raw ciphertext, and the replication
+	// headers carry no compression state. Sending a compressed SSE-C object
+	// would land a replica that decrypts to an S2 stream instead of the
+	// object, so fail loudly instead of writing a wrong replica.
+	if isSSEC && objInfo.IsCompressed() {
+		return putOpts, false, fmt.Errorf("replication of a compressed SSE-C object is not supported: %s/%s(%s)",
+			objInfo.Bucket, objInfo.Name, objInfo.VersionID)
+	}
 
 	for k, v := range objInfo.UserDefined {
 		_, isValidSSEHeader := validSSEReplicationHeaders[k]
@@ -835,16 +909,11 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (put
 		tag, _ := tags.ParseObjectTags(objInfo.UserTags)
 		if tag != nil {
 			putOpts.UserTags = tag.ToMap()
-			// set tag timestamp in opts
-			tagTimestamp := objInfo.ModTime
-			if tagTmstampStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp]; ok {
-				tagTimestamp, err = time.Parse(time.RFC3339Nano, tagTmstampStr)
-				if err != nil {
-					return putOpts, false, err
-				}
-			}
-			putOpts.Internal.TaggingTimestamp = tagTimestamp
 		}
+	}
+	putOpts.Internal.TaggingTimestamp, err = replicationTaggingTimestamp(objInfo)
+	if err != nil {
+		return putOpts, false, err
 	}
 
 	lkMap := caseInsensitiveMap(objInfo.UserDefined)
@@ -857,19 +926,29 @@ func putReplicationOpts(ctx context.Context, sc string, objInfo ObjectInfo) (put
 	if cc, ok := lkMap.Lookup(xhttp.CacheControl); ok {
 		putOpts.CacheControl = cc
 	}
-	if mode, ok := lkMap.Lookup(xhttp.AmzObjectLockMode); ok {
-		rmode := minio.RetentionMode(mode)
-		putOpts.Mode = rmode
+	mode, hasMode := lkMap.Lookup(xhttp.AmzObjectLockMode)
+	retainDateStr, hasRetainDate := lkMap.Lookup(xhttp.AmzObjectLockRetainUntilDate)
+	if hasMode {
+		putOpts.Mode = minio.RetentionMode(mode)
 	}
-	if retainDateStr, ok := lkMap.Lookup(xhttp.AmzObjectLockRetainUntilDate); ok {
+	// A removed retention is stored as an empty or absent mode and date; it is
+	// sent as a value-less update that still carries its ordering timestamp.
+	if hasRetainDate && retainDateStr != "" {
 		rdate, err := amztime.ISO8601Parse(retainDateStr)
 		if err != nil {
 			return putOpts, false, err
 		}
 		putOpts.RetainUntilDate = rdate
-		// set retention timestamp in opts
+	}
+	retainTmstampStr, hasRetainTmstamp := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp]
+	if hasMode || hasRetainDate || hasRetainTmstamp {
+		// Send the ordering timestamp whenever the version carries one, even for a
+		// removal whose value keys are absent (the shape a retransmit PUT leaves),
+		// so the next hop can order the removal instead of keeping obsolete
+		// retention.
 		retTimestamp := objInfo.ModTime
-		if retainTmstampStr, ok := objInfo.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp]; ok {
+		if hasRetainTmstamp {
+			var err error
 			retTimestamp, err = time.Parse(time.RFC3339Nano, retainTmstampStr)
 			if err != nil {
 				return putOpts, false, err
@@ -931,11 +1010,17 @@ func equals(k1 string, keys ...string) bool {
 	return false
 }
 
+// nullVersionExcludedFromResync reports the exclusion at the head of getReplicationAction, kept
+// verbatim from upstream: an existing object resync leaves a null version alone when the source
+// modification time is later than the one the target reports, without comparing anything else.
+func nullVersionExcludedFromResync(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replication.Type) bool {
+	return opType == replication.ExistingObjectReplicationType &&
+		oi1.ModTime.Unix() > oi2.LastModified.Unix() && oi1.VersionID == nullVersionID
+}
+
 // returns replicationAction by comparing metadata between source and target
 func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replication.Type) replicationAction {
-	// Avoid resyncing null versions created prior to enabling replication if target has a newer copy
-	if opType == replication.ExistingObjectReplicationType &&
-		oi1.ModTime.Unix() > oi2.LastModified.Unix() && oi1.VersionID == nullVersionID {
+	if nullVersionExcludedFromResync(oi1, oi2, opType) {
 		return replicateNone
 	}
 	sz, _ := oi1.GetActualSize()
@@ -972,6 +1057,12 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 	if (oi2.UserTagCount > 0 && !reflect.DeepEqual(oi2Map, t.ToMap())) || (oi2.UserTagCount != len(t.ToMap())) {
 		return replicateMetadata
 	}
+	// HEAD does not report the tag revision. Equal values can hide a newer
+	// deletion or re-addition, so scheduled metadata/heal work must deliver it.
+	// Completed objects are still excluded by the existing scanner gates.
+	if _, ok := caseInsensitiveMap(oi1.UserDefined).Lookup(ReservedMetadataPrefixLower + TaggingTimestamp); ok {
+		return replicateMetadata
+	}
 
 	// Compare only necessary headers
 	compareKeys := []string{
@@ -986,9 +1077,21 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 		"X-Amz-Meta-",
 	}
 
+	// An empty object lock mode or retain-until-date records a removed retention, but
+	// it is omitted from GET/HEAD response headers: setObjectHeaders() skips both keys
+	// when the value is empty, and FilterObjectLockMetadata() drops them when the mode
+	// is not valid. The target can therefore never report them, so treat empty and
+	// absent as equal rather than as a permanent difference.
+	emptyLockValue := func(k, v string) bool {
+		return v == "" && equals(k, xhttp.AmzObjectLockMode, xhttp.AmzObjectLockRetainUntilDate)
+	}
+
 	// compare metadata on both maps to see if meta is identical
 	compareMeta1 := make(map[string]string)
 	for k, v := range oi1.UserDefined {
+		if emptyLockValue(k, v) {
+			continue
+		}
 		var found bool
 		for _, prefix := range compareKeys {
 			if !stringsHasPrefixFold(k, prefix) {
@@ -1004,6 +1107,10 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 
 	compareMeta2 := make(map[string]string)
 	for k, v := range oi2.Metadata {
+		val := strings.Join(v, ",")
+		if emptyLockValue(k, val) {
+			continue
+		}
 		var found bool
 		for _, prefix := range compareKeys {
 			if !stringsHasPrefixFold(k, prefix) {
@@ -1013,7 +1120,7 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 			break
 		}
 		if found {
-			compareMeta2[strings.ToLower(k)] = strings.Join(v, ",")
+			compareMeta2[strings.ToLower(k)] = val
 		}
 	}
 
@@ -1024,9 +1131,87 @@ func getReplicationAction(oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replicati
 	return replicateNone
 }
 
+// objectRetentionGetter is the part of the replication target client used to confirm whether a
+// destination version still holds Object Lock retention.
+type objectRetentionGetter interface {
+	GetObjectRetention(ctx context.Context, bucketName, objectName, versionID string) (*minio.RetentionMode, *time.Time, error)
+}
+
+// retentionRemovedAtSource reports whether oi carries the shape a removed retention leaves behind.
+// Two representations persist. A retention removed directly on this cluster keeps the object lock
+// keys present with empty values (PutObjectRetentionHandler, cmd/object-handlers.go:3309-3316). A
+// removal that arrived by replication keeps only the retention ordering timestamp, with the mode
+// and retain-until-date keys absent, because restoreRetention and the replica update path write
+// the timestamp alone when the mode is empty (cmd/bucket-object-lock.go:388-399,
+// cmd/object-handlers.go:1782-1797). A present ordering timestamp paired with a non-empty mode is
+// a retention that was set, not removed, and must not be mistaken for one.
+func retentionRemovedAtSource(oi ObjectInfo) bool {
+	lkMap := caseInsensitiveMap(oi.UserDefined)
+	// Representation (1): an object lock key is present with an empty value.
+	for _, k := range []string{xhttp.AmzObjectLockMode, xhttp.AmzObjectLockRetainUntilDate} {
+		if v, ok := lkMap.Lookup(k); ok && v == "" {
+			return true
+		}
+	}
+	// Representation (2): a recorded retention ordering timestamp with the mode value absent or
+	// empty is a removal restoreRetention persisted without the empty public keys.
+	if _, ok := oi.UserDefined[ReservedMetadataPrefixLower+ObjectLockRetentionTimestamp]; ok {
+		if v, ok := lkMap.Lookup(xhttp.AmzObjectLockMode); !ok || v == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// targetRetentionConfirmedAbsent reports whether the destination version is known to hold no
+// retention. A HEAD response omits retention both when the version has none and when the
+// replication credential lacks s3:GetObjectRetention (cmd/object-handlers.go:942-946), so the
+// comparison in getReplicationAction on its own cannot tell a removal that is already in sync from
+// one the destination still holds. Only NoSuchObjectLockConfiguration, the answer for a version
+// that carries no retention, and a response naming no retention mode count as absent. Everything
+// else is uncertainty and is treated as still present, so that the removal is resent exactly as it
+// is today: a denied or unreachable destination, a mode the SDK returned without recognizing since
+// it does not validate it, and InvalidRequest, which names a bucket with no Object Lock
+// configuration but is also what a destination answers when its own read of that configuration
+// fails (cmd/bucket-object-lock.go:39-50 returns an error with a zero Retention, discarded at
+// cmd/object-handlers.go:3275).
+func targetRetentionConfirmedAbsent(ctx context.Context, tgt objectRetentionGetter, bucket, object, versionID string) bool {
+	mode, _, err := tgt.GetObjectRetention(ctx, bucket, object, versionID)
+	if err != nil {
+		return minio.ToErrorResponse(err).Code == "NoSuchObjectLockConfiguration"
+	}
+	// An absent or empty mode is no retention. A non-empty mode is retention, whether or not this
+	// SDK recognizes it.
+	return mode == nil || *mode == ""
+}
+
+// replicationActionForTarget returns the action for a source version against a destination that
+// answered HEAD. It is getReplicationAction plus the confirmation that a removed retention which
+// compares as in sync really is: see targetRetentionConfirmedAbsent.
+func replicationActionForTarget(ctx context.Context, oi1 ObjectInfo, oi2 minio.ObjectInfo, opType replication.Type, tgt objectRetentionGetter, bucket, object string) replicationAction {
+	rAction := getReplicationAction(oi1, oi2, opType)
+	if rAction != replicateNone || !retentionRemovedAtSource(oi1) {
+		return rAction
+	}
+	// A null version the resync deliberately leaves alone is not a comparison result, so it is
+	// not the confirmation's to reopen.
+	if nullVersionExcludedFromResync(oi1, oi2, opType) {
+		return rAction
+	}
+	if targetRetentionConfirmedAbsent(ctx, tgt, bucket, object, oi1.VersionID) {
+		return rAction
+	}
+	return replicateMetadata
+}
+
 // replicateObject replicates the specified version of the object to destination bucket
 // The source object is then updated to reflect the replication status.
-func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI ObjectLayer) {
+// replicateObject replicates a single object version to all applicable targets
+// and returns the per-target replication outcome. Callers that only trigger
+// replication may ignore the return value; the resync path uses it to classify
+// success/failure per target rather than inferring it from the mere existence
+// of the target version.
+func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI ObjectLayer) replicatedInfos {
 	var replicationStatus replication.StatusType
 	defer func() {
 		if replicationStatus.Empty() {
@@ -1059,7 +1244,7 @@ func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI Obje
 			UserAgent:  "Internal: [Replication]",
 			Host:       globalLocalNodeName,
 		})
-		return
+		return replicatedInfos{}
 	}
 	tgtArns := cfg.FilterTargetArns(replication.ObjectOpts{
 		Name:     object,
@@ -1079,7 +1264,7 @@ func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI Obje
 			Host:       globalLocalNodeName,
 		})
 		globalReplicationPool.Get().queueMRFSave(ri.ToMRFEntry())
-		return
+		return replicatedInfos{}
 	}
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx)
@@ -1144,9 +1329,6 @@ func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI Obje
 						oi.UserDefined[targetResetHeader(rinfo.Arn)] = rinfo.ResyncTimestamp
 					}
 				}
-				if ri.UserTags != "" {
-					oi.UserDefined[xhttp.AmzObjectTagging] = ri.UserTags
-				}
 				return dsc, nil
 			},
 		}
@@ -1185,6 +1367,7 @@ func replicateObject(ctx context.Context, ri ReplicateObjectInfo, objectAPI Obje
 		ri.RetryCount++
 		globalReplicationPool.Get().queueMRFSave(ri.ToMRFEntry())
 	}
+	return rinfos
 }
 
 // replicateObject replicates object data for specified version of the object to destination bucket
@@ -1299,6 +1482,8 @@ func (ri ReplicateObjectInfo) replicateObject(ctx context.Context, objectAPI Obj
 
 	putOpts, isMP, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo)
 	if err != nil {
+		rinfo.Err = err
+		rinfo.ReplicationStatus = replication.Failed
 		replLogIf(ctx, fmt.Errorf("failure setting options for replication bucket:%s err:%w", bucket, err))
 		sendEvent(eventArgs{
 			EventName:  event.ObjectReplicationNotTracked,
@@ -1467,7 +1652,7 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 	sOpts.Set(xhttp.AmzTagDirective, "ACCESS")
 	oi, cerr := tgt.StatObject(ctx, tgt.Bucket, object, sOpts)
 	if cerr == nil {
-		rAction = getReplicationAction(objInfo, oi, ri.OpType)
+		rAction = replicationActionForTarget(ctx, objInfo, oi, ri.OpType, tgt, tgt.Bucket, object)
 		rinfo.ReplicationStatus = replication.Completed
 		if rAction == replicateNone {
 			if ri.OpType == replication.ExistingObjectReplicationType &&
@@ -1497,11 +1682,14 @@ func (ri ReplicateObjectInfo) replicateAll(ctx context.Context, objectAPI Object
 			return rinfo
 		}
 	} else {
-		// SSEC objects will refuse HeadObject without the decryption key.
-		// Ignore the error, since we know the object exists and versioning prevents overwriting existing versions.
+		// The sender holds no customer key, so the target refuses HeadObject on
+		// an SSE-C object and the replica cannot be compared. The metadata-only
+		// CopyObject that a replicateMetadata action would run then fails on any
+		// non-empty object, because the undecryptable source checksum makes the
+		// target recompute one and rewrite the data. A full retransmit is the
+		// only action that completes.
 		if isSSEC && strings.Contains(cerr.Error(), errorCodes[ErrSSEEncryptedObject].Description) {
-			rinfo.ReplicationStatus = replication.Completed
-			rinfo.ReplicationAction = replicateNone
+			rAction = replicateAll
 			goto applyAction
 		}
 		// if target returns error other than NoSuchKey, defer replication attempt
@@ -1558,14 +1746,11 @@ applyAction:
 		if _, ok := lkMap.Lookup(xhttp.AmzObjectLockRetainUntilDate); ok {
 			dstOpts.Internal.RetentionTimestamp = objInfo.ModTime
 		}
-		if objInfo.UserTags != "" {
-			dstOpts.Internal.TaggingTimestamp = objInfo.ModTime
-		}
-		if tagTmStr, ok := lkMap.Lookup(ReservedMetadataPrefixLower + TaggingTimestamp); ok {
-			ondiskTimestamp, err := time.Parse(time.RFC3339, tagTmStr)
-			if err == nil {
-				dstOpts.Internal.TaggingTimestamp = ondiskTimestamp
-			}
+		dstOpts.Internal.TaggingTimestamp, rinfo.Err = replicationTaggingTimestamp(objInfo)
+		if rinfo.Err != nil {
+			rinfo.ReplicationStatus = replication.Failed
+			replLogIf(ctx, fmt.Errorf("invalid tagging timestamp for object %s/%s(%s): %w", bucket, object, objInfo.VersionID, rinfo.Err))
+			return rinfo
 		}
 		if retTmStr, ok := lkMap.Lookup(ReservedMetadataPrefixLower + ObjectLockRetentionTimestamp); ok {
 			ondiskTimestamp, err := time.Parse(time.RFC3339, retTmStr)
@@ -1586,6 +1771,11 @@ applyAction:
 	} else {
 		putOpts, isMP, err := putReplicationOpts(ctx, tgt.StorageClass, objInfo)
 		if err != nil {
+			// rinfo was primed Completed above; a failure to build the write
+			// options means nothing reached the target, so mark it Failed and
+			// carry the error instead of reporting a phantom success.
+			rinfo.ReplicationStatus = replication.Failed
+			rinfo.Err = err
 			replLogIf(ctx, fmt.Errorf("failed to set replicate options for object %s/%s(%s) (target %s) err:%w", bucket, objInfo.Name, objInfo.VersionID, tgt.EndpointURL(), err))
 			sendEvent(eventArgs{
 				EventName:  event.ObjectReplicationNotTracked,
@@ -1780,11 +1970,61 @@ func filterReplicationStatusMetadata(metadata map[string]string) map[string]stri
 // DeletedObjectReplicationInfo has info on deleted object
 type DeletedObjectReplicationInfo struct {
 	DeletedObject
-	Bucket    string
-	EventType string
-	OpType    replication.Type
-	ResetID   string
-	TargetArn string
+	Bucket     string
+	EventType  string
+	OpType     replication.Type
+	ResetID    string
+	TargetArn  string
+	RetryCount int
+}
+
+// isVersionPurge also recognizes the old marker-shaped purge task. Use the
+// operation's state, rather than one target's possibly missing purge entry.
+func (di DeletedObjectReplicationInfo) isVersionPurge() bool {
+	return di.VersionID != "" || di.DeleteMarkerVersionID != "" && !di.VersionPurgeStatus().Empty()
+}
+
+// creationState is the outcome of re-reading a queued delete-marker creation
+// against the source.
+type creationState int
+
+const (
+	creationCurrent creationState = iota
+	creationStale
+	creationUnverified
+)
+
+// deleteMarkerCreationState re-reads the marker a queued creation task refers
+// to. The version being absent, no longer a marker, or under a version purge
+// makes the creation stale. A failed read is not absence: the caller retries
+// later instead of guessing.
+func deleteMarkerCreationState(ctx context.Context, objectAPI ObjectLayer, dobj DeletedObjectReplicationInfo) creationState {
+	oi, err := objectAPI.GetObjectInfo(ctx, dobj.Bucket, dobj.ObjectName, ObjectOptions{
+		VersionID:        dobj.DeleteMarkerVersionID,
+		Versioned:        globalBucketVersioningSys.PrefixEnabled(dobj.Bucket, dobj.ObjectName),
+		VersionSuspended: globalBucketVersioningSys.Suspended(dobj.Bucket),
+	})
+	switch {
+	case isErrObjectNotFound(err), isErrVersionNotFound(err):
+		return creationStale
+	case err != nil && !isErrMethodNotAllowed(err):
+		return creationUnverified
+	}
+	if !oi.DeleteMarker || oi.VersionID != dobj.DeleteMarkerVersionID {
+		return creationStale
+	}
+	if !oi.VersionPurgeStatus.Empty() || oi.VersionPurgeStatusInternal != "" {
+		return creationStale
+	}
+	return creationCurrent
+}
+
+// Purge metadata uses COMPLETE; operation statistics and audit use COMPLETED.
+func purgeReplicationStatus(status VersionPurgeStatusType) replication.StatusType {
+	if replication.StatusType(status) == replication.CompletedLegacy {
+		return replication.Completed
+	}
+	return replication.StatusType(status)
 }
 
 // ToMRFEntry returns the relevant info needed by MRF
@@ -1794,9 +2034,10 @@ func (di DeletedObjectReplicationInfo) ToMRFEntry() MRFReplicateEntry {
 		versionID = di.VersionID
 	}
 	return MRFReplicateEntry{
-		Bucket:    di.Bucket,
-		Object:    di.ObjectName,
-		versionID: versionID,
+		Bucket:     di.Bucket,
+		Object:     di.ObjectName,
+		versionID:  versionID,
+		RetryCount: di.RetryCount,
 	}
 }
 
@@ -2218,9 +2459,9 @@ func (p *ReplicationPool) queueReplicaTask(ri ReplicateObjectInfo) {
 	switch ri.OpType {
 	case replication.HealReplicationType, replication.ExistingObjectReplicationType:
 		ch = p.mrfReplicaCh
-		healCh = p.getWorkerCh(ri.Name, ri.Bucket, ri.Size)
+		healCh = p.getWorkerCh(ri.Bucket, ri.Name, ri.Size)
 	default:
-		ch = p.getWorkerCh(ri.Name, ri.Bucket, ri.Size)
+		ch = p.getWorkerCh(ri.Bucket, ri.Name, ri.Size)
 	}
 	if ch == nil && healCh == nil {
 		return
@@ -2288,6 +2529,7 @@ func (p *ReplicationPool) queueReplicaDeleteTask(doi DeletedObjectReplicationInf
 	case <-p.ctx.Done():
 	case ch <- doi:
 	default:
+		doi.RetryCount++
 		p.queueMRFSave(doi.ToMRFEntry())
 		p.mu.RLock()
 		prio := p.priority
@@ -2828,10 +3070,10 @@ const (
 
 func newresyncer() *replicationResyncer {
 	rs := replicationResyncer{
-		statusMap:      make(map[string]BucketReplicationResyncStatus),
-		workerSize:     resyncWorkerCnt,
-		resyncCancelCh: make(chan struct{}, resyncWorkerCnt),
-		workerCh:       make(chan struct{}, resyncWorkerCnt),
+		statusMap:     make(map[string]BucketReplicationResyncStatus),
+		workerSize:    resyncWorkerCnt,
+		cancelResyncs: make(map[resyncOpts]context.CancelCauseFunc),
+		workerCh:      make(chan struct{}, resyncWorkerCnt),
 	}
 	for i := 0; i < rs.workerSize; i++ {
 		rs.workerCh <- struct{}{}
@@ -2839,13 +3081,67 @@ func newresyncer() *replicationResyncer {
 	return &rs
 }
 
+var errResyncCanceled = errors.New("replication resync canceled")
+
+// Registration and cancellation share the status lock. A queued run therefore
+// cannot miss cancellation between publishing its status and taking a slot.
+func (s *replicationResyncer) registerResync(parent context.Context, opts resyncOpts) (context.Context, context.CancelCauseFunc, bool) {
+	s.Lock()
+	defer s.Unlock()
+	st, ok := s.statusMap[opts.bucket].TargetsMap[opts.arn]
+	if !ok || st.ResyncID != opts.resyncID {
+		return nil, nil, false
+	}
+	if _, running := s.cancelResyncs[opts]; running {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithCancelCause(parent)
+	if s.cancelResyncs == nil {
+		s.cancelResyncs = make(map[resyncOpts]context.CancelCauseFunc)
+	}
+	s.cancelResyncs[opts] = cancel
+	if st.ResyncStatus == ResyncCanceled {
+		cancel(errResyncCanceled)
+	}
+	return ctx, cancel, true
+}
+
+func (s *replicationResyncer) cancelResyncID(resyncID string) {
+	s.Lock()
+	defer s.Unlock()
+	for bucket, m := range s.statusMap {
+		for arn, st := range m.TargetsMap {
+			if st.ResyncID == resyncID && (st.ResyncStatus == ResyncPending || st.ResyncStatus == ResyncStarted) {
+				st.ResyncStatus = ResyncCanceled
+				st.LastUpdate = UTCNow()
+				m.TargetsMap[arn] = st
+				m.LastUpdate = st.LastUpdate
+			}
+		}
+		s.statusMap[bucket] = m
+	}
+	for opts, cancel := range s.cancelResyncs {
+		if opts.resyncID == resyncID {
+			cancel(errResyncCanceled)
+		}
+	}
+}
+
 // mark status of replication resync on remote target for the bucket
-func (s *replicationResyncer) markStatus(status ResyncStatusType, opts resyncOpts, objAPI ObjectLayer) {
+func (s *replicationResyncer) markStatus(status ResyncStatusType, opts resyncOpts, objAPI ObjectLayer) ResyncStatusType {
 	s.Lock()
 	defer s.Unlock()
 
 	m := s.statusMap[opts.bucket]
-	st := m.TargetsMap[opts.arn]
+	st, ok := m.TargetsMap[opts.arn]
+	if !ok || st.ResyncID != opts.resyncID {
+		return NoResync
+	}
+	// A cancel may win the lock after the finalizer checked its context.
+	// Persist that cancellation, never a stale Started/Completed result.
+	if st.ResyncStatus == ResyncCanceled {
+		status = ResyncCanceled
+	}
 	st.LastUpdate = UTCNow()
 	st.ResyncStatus = status
 	m.TargetsMap[opts.arn] = st
@@ -2855,14 +3151,18 @@ func (s *replicationResyncer) markStatus(status ResyncStatusType, opts resyncOpt
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	saveResyncStatus(ctx, opts.bucket, m, objAPI)
+	return status
 }
 
 // update replication resync stats for bucket's remote target
-func (s *replicationResyncer) incStats(ts TargetReplicationResyncStatus, opts resyncOpts) {
+func (s *replicationResyncer) incStats(ts TargetReplicationResyncStatus, opts resyncOpts) bool {
 	s.Lock()
 	defer s.Unlock()
 	m := s.statusMap[opts.bucket]
-	st := m.TargetsMap[opts.arn]
+	st, ok := m.TargetsMap[opts.arn]
+	if !ok || st.ResyncID != opts.resyncID || st.ResyncStatus == ResyncCanceled {
+		return false
+	}
 	st.Object = ts.Object
 	st.ReplicatedCount += ts.ReplicatedCount
 	st.FailedCount += ts.FailedCount
@@ -2871,20 +3171,175 @@ func (s *replicationResyncer) incStats(ts TargetReplicationResyncStatus, opts re
 	m.TargetsMap[opts.arn] = st
 	m.LastUpdate = UTCNow()
 	s.statusMap[opts.bucket] = m
+	return true
+}
+
+// resyncResults consumes the per-object outcomes produced by the resync worker
+// pool and applies each to the in-memory resync status via apply. It centralizes
+// the finalization ordering so a status persisted after finish() returns always
+// reflects every result.
+type resyncResults struct {
+	ch    chan TargetReplicationResyncStatus
+	apply func(TargetReplicationResyncStatus)
+	wg    sync.WaitGroup
+}
+
+// newResyncResults starts the result-consuming goroutine that folds each worker
+// result into the bucket's resync status.
+func (s *replicationResyncer) newResyncResults(opts resyncOpts) *resyncResults {
+	return startResyncResults(func(r TargetReplicationResyncStatus) {
+		if s.incStats(r, opts) {
+			globalSiteResyncMetrics.updateMetric(r, opts.resyncID)
+		}
+	})
+}
+
+// startResyncResults starts a goroutine that applies every received result with
+// apply. Injecting the apply action keeps the shutdown ordering in finish()
+// testable.
+func startResyncResults(apply func(TargetReplicationResyncStatus)) *resyncResults {
+	rr := &resyncResults{
+		ch:    make(chan TargetReplicationResyncStatus, 1),
+		apply: apply,
+	}
+	rr.wg.Add(1)
+	go func() {
+		defer rr.wg.Done()
+		for r := range rr.ch {
+			rr.apply(r)
+		}
+	}()
+	return rr
+}
+
+// finish shuts the resync pipeline down in an order that guarantees a status
+// persisted afterwards reflects every result. It first closes the worker input
+// channels and waits for the producer workers to exit, so none can send on a
+// closed result channel (a hazard on early-return paths) and every submitted
+// result is delivered (a result a worker discards on cancellation is
+// intentionally not); only then does it close the result channel and wait for
+// the consumer to apply the last buffered result.
+func (rr *resyncResults) finish(workers []chan ReplicateObjectInfo, workerWg *sync.WaitGroup) {
+	for i := range workers {
+		xioutil.SafeClose(workers[i])
+	}
+	workerWg.Wait()
+	xioutil.SafeClose(rr.ch)
+	rr.wg.Wait()
+}
+
+// sendResyncResult delivers a worker's computed per-object result to ch,
+// returning false if the run's context was canceled first.
+func (s *replicationResyncer) sendResyncResult(ctx context.Context, ch chan<- TargetReplicationResyncStatus, st TargetReplicationResyncStatus) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case ch <- st:
+		return true
+	}
+}
+
+// User cancellation is terminal; interrupted completion remains retryable.
+func finalResyncStatus(status ResyncStatusType, cause error) ResyncStatusType {
+	if errors.Is(cause, errResyncCanceled) {
+		return ResyncCanceled
+	}
+	if status == ResyncCompleted && cause != nil {
+		return ResyncFailed
+	}
+	return status
+}
+
+// resyncTargetSucceeded reports whether this object (or delete) actually
+// replicated to the target, from the target's own outcome. A version purge
+// reports success through VersionPurgeStatus, not ReplicationStatus. For an
+// object or delete marker, success requires a Completed status; a retained
+// error is a real failure unless it is the benign duplicate 412 the
+// destination returns when it already holds this exact ETag and version, which
+// replicateAll deliberately keeps Completed.
+func resyncTargetSucceeded(t replicatedTargetInfo, roi ReplicateObjectInfo) bool {
+	if !roi.VersionPurgeStatus.Empty() {
+		return t.VersionPurgeStatus == replication.VersionPurgeComplete
+	}
+	if t.ReplicationStatus != replication.Completed {
+		return false
+	}
+	return t.Err == nil || minio.ToErrorResponse(t.Err).Code == "PreconditionFailed"
+}
+
+// resyncResultFor derives the resync outcome for target arn from the aggregate
+// replication result of a single object (or delete). The target counts as a
+// success only when its own replication Completed without error - not when the
+// target version merely exists. A target that Failed, errored, or was not
+// attempted for this object (its arn absent from the result) counts as a
+// failure, and the failed byte count is recorded (previously always zero).
+func resyncResultFor(rinfos replicatedInfos, arn string, roi ReplicateObjectInfo) TargetReplicationResyncStatus {
+	st := TargetReplicationResyncStatus{Object: roi.Name, Bucket: roi.Bucket}
+	for _, t := range rinfos.Targets {
+		if t.Arn != arn {
+			continue
+		}
+		if resyncTargetSucceeded(t, roi) {
+			sz := t.Size
+			if sz == 0 {
+				sz = roi.Size
+			}
+			st.ReplicatedCount++
+			st.ReplicatedSize += sz
+		} else {
+			st.FailedCount++
+			st.FailedSize += roi.Size
+		}
+		return st
+	}
+	// arn was not attempted for this object: a resync that cannot confirm the
+	// object reached the target is not a success.
+	st.FailedCount++
+	st.FailedSize += roi.Size
+	return st
+}
+
+// objectNeedsResyncForARN reports whether roi must be resynced for target arn
+// specifically. The resync worker pool is scoped to a single target (opts.arn),
+// so an object that only qualifies for a different target must be skipped here:
+// admitting it would replicate it for arn's peers only, leaving arn absent from
+// the per-object result, which resyncResultFor then (correctly, but
+// misleadingly) counts as a failure for arn - an object arn was never
+// responsible for. Only opts.arn carries this resync's ResetID, and that reset
+// is already folded into its per-target decision, so the per-target check both
+// scopes dispatch and honors the reset.
+func objectNeedsResyncForARN(roi ReplicateObjectInfo, arn string) bool {
+	return roi.ExistingObjResync.mustResyncTarget(arn)
 }
 
 // resyncBucket resyncs all qualifying objects as per replication rules for the target
 // ARN
 func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI ObjectLayer, heal bool, opts resyncOpts) {
+	ctx, cancel, registered := s.registerResync(ctx, opts)
+	if !registered {
+		return
+	}
+	defer func() {
+		cancel(nil)
+		s.Lock()
+		delete(s.cancelResyncs, opts)
+		s.Unlock()
+	}()
 	select {
 	case <-s.workerCh: // block till a worker is available
 	case <-ctx.Done():
+		if errors.Is(context.Cause(ctx), errResyncCanceled) {
+			status := s.markStatus(ResyncCanceled, opts, objectAPI)
+			globalSiteResyncMetrics.incBucket(opts, status)
+		}
 		return
 	}
 
 	resyncStatus := ResyncFailed
 	defer func() {
-		s.markStatus(resyncStatus, opts, objectAPI)
+		// Runs after workers/results drain and before our own deferred cancel.
+		resyncStatus = finalResyncStatus(resyncStatus, context.Cause(ctx))
+		resyncStatus = s.markStatus(resyncStatus, opts, objectAPI)
 		globalSiteResyncMetrics.incBucket(opts, resyncStatus)
 		s.workerCh <- struct{}{}
 	}()
@@ -2919,8 +3374,8 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 		return
 	}
 	// mark resync status as resync started
-	if !heal {
-		s.markStatus(ResyncStarted, opts, objectAPI)
+	if !heal && s.markStatus(ResyncStarted, opts, objectAPI) != ResyncStarted {
+		return
 	}
 
 	// Walk through all object versions - Walk() is always in ascending order needed to ensure
@@ -2939,16 +3394,21 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 		lastCheckpoint = st.Object
 	}
 	workers := make([]chan ReplicateObjectInfo, resyncParallelRoutines)
-	resultCh := make(chan TargetReplicationResyncStatus, 1)
-	defer xioutil.SafeClose(resultCh)
-	go func() {
-		for r := range resultCh {
-			s.incStats(r, opts)
-			globalSiteResyncMetrics.updateMetric(r, opts.resyncID)
-		}
-	}()
-
 	var wg sync.WaitGroup
+	// results consumes each worker's per-object outcome and folds it into the
+	// in-memory status. finish() (deferred below) stops the workers and drains
+	// every result before the deferred markStatus persists, so a Completed status
+	// cannot race the last incStats. Registered after the markStatus finalizer, so
+	// LIFO runs finish first.
+	results := s.newResyncResults(opts)
+	defer func() {
+		if resyncStatus != ResyncCompleted {
+			cancel(nil)
+		}
+		// Exactly one finish: success drains with a live context; errors stop
+		// blocked workers first. Both drain counts before persisting status.
+		results.finish(workers, &wg)
+	}()
 	for i := range resyncParallelRoutines {
 		wg.Add(1)
 		workers[i] = make(chan ReplicateObjectInfo, 100)
@@ -2959,10 +3419,10 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 				select {
 				case <-ctx.Done():
 					return
-				case <-s.resyncCancelCh:
 				default:
 				}
 				traceFn := s.trace(tgt.ResetID, fmt.Sprintf("%s/%s (%s)", opts.bucket, roi.Name, roi.VersionID))
+				var rinfos replicatedInfos
 				if roi.DeleteMarker || !roi.VersionPurgeStatus.Empty() {
 					versionID := ""
 					dmVersionID := ""
@@ -2985,83 +3445,69 @@ func (s *replicationResyncer) resyncBucket(ctx context.Context, objectAPI Object
 						OpType:    replication.ExistingObjectReplicationType,
 						EventType: ReplicateExistingDelete,
 					}
-					replicateDelete(ctx, doi, objectAPI)
+					rinfos = replicateDelete(ctx, doi, objectAPI)
 				} else {
 					roi.OpType = replication.ExistingObjectReplicationType
 					roi.EventType = ReplicateExisting
-					replicateObject(ctx, roi, objectAPI)
+					rinfos = replicateObject(ctx, roi, objectAPI)
 				}
 
-				st := TargetReplicationResyncStatus{
-					Object: roi.Name,
-					Bucket: roi.Bucket,
-				}
-
-				_, err := tgt.StatObject(ctx, tgt.Bucket, roi.Name, minio.StatObjectOptions{
-					VersionID: roi.VersionID,
-					Internal: minio.AdvancedGetOptions{
-						ReplicationProxyRequest: "false",
-					},
-				})
-				sz := roi.Size
-				if err != nil {
-					if roi.DeleteMarker && isErrMethodNotAllowed(ErrorRespToObjectError(err, opts.bucket, roi.Name)) {
-						st.ReplicatedCount++
-					} else {
-						st.FailedCount++
+				// Classify success/failure from the actual replication outcome
+				// for this target, not from whether the target version merely
+				// exists (a rejected update leaves the old version in place).
+				st := resyncResultFor(rinfos, opts.arn, roi)
+				var traceSize int64
+				var traceErr error
+				for i := range rinfos.Targets {
+					if rinfos.Targets[i].Arn == opts.arn {
+						traceSize, traceErr = rinfos.Targets[i].Size, rinfos.Targets[i].Err
+						break
 					}
-					sz = 0
-				} else {
-					st.ReplicatedCount++
-					st.ReplicatedSize += roi.Size
 				}
-				traceFn(sz, err)
-				select {
-				case <-ctx.Done():
+				traceFn(traceSize, traceErr)
+				if !s.sendResyncResult(ctx, results.ch, st) {
 					return
-				case <-s.resyncCancelCh:
-					return
-				case resultCh <- st:
 				}
 			}
 		}(ctx, i)
 	}
-	for res := range objInfoCh {
+walkLoop:
+	for {
+		var res itemOrErr[ObjectInfo]
+		select {
+		case <-ctx.Done():
+			return
+		case item, ok := <-objInfoCh:
+			if !ok {
+				break walkLoop
+			}
+			res = item
+		}
 		if res.Err != nil {
 			resyncStatus = ResyncFailed
 			replLogIf(ctx, res.Err)
 			return
-		}
-		select {
-		case <-s.resyncCancelCh:
-			resyncStatus = ResyncCanceled
-			return
-		case <-ctx.Done():
-			return
-		default:
 		}
 		if heal && lastCheckpoint != "" && lastCheckpoint != res.Item.Name {
 			continue
 		}
 		lastCheckpoint = ""
 		roi := getHealReplicateObjectInfo(res.Item, rcfg)
-		if !roi.ExistingObjResync.mustResync() {
+		// Scope dispatch to this resync's target: the worker pool is for
+		// opts.arn, so skip objects that only need resync for a different
+		// target (each target has its own resync). Without this, a cross-target
+		// object leaves opts.arn absent from its per-object result and is
+		// miscounted as an opts.arn failure.
+		if !objectNeedsResyncForARN(roi, opts.arn) {
 			continue
 		}
+		h := xxh3.HashString(roi.Bucket + roi.Name)
 		select {
-		case <-s.resyncCancelCh:
-			return
 		case <-ctx.Done():
 			return
-		default:
-			h := xxh3.HashString(roi.Bucket + roi.Name)
-			workers[h%uint64(resyncParallelRoutines)] <- roi
+		case workers[h%uint64(resyncParallelRoutines)] <- roi:
 		}
 	}
-	for i := range resyncParallelRoutines {
-		xioutil.SafeClose(workers[i])
-	}
-	wg.Wait()
 	resyncStatus = ResyncCompleted
 }
 
@@ -3087,9 +3533,9 @@ func (s *replicationResyncer) start(ctx context.Context, objAPI ObjectLayer, opt
 	if len(tgtArns) == 0 {
 		return fmt.Errorf("arn %s specified for resync not found in replication config", opts.arn)
 	}
-	globalReplicationPool.Get().resyncer.RLock()
-	data, ok := globalReplicationPool.Get().resyncer.statusMap[opts.bucket]
-	globalReplicationPool.Get().resyncer.RUnlock()
+	s.Lock()
+	defer s.Unlock()
+	data, ok := s.statusMap[opts.bucket]
 	if !ok {
 		data, err = loadBucketResyncMetadata(ctx, opts.bucket, objAPI)
 		if err != nil {
@@ -3110,23 +3556,14 @@ func (s *replicationResyncer) start(ctx context.Context, objAPI ObjectLayer, opt
 		ResyncStatus:     ResyncPending,
 		Bucket:           opts.bucket,
 	}
+	data.TargetsMap = data.cloneTgtStats()
 	data.TargetsMap[opts.arn] = status
 	if err = saveResyncStatus(ctx, opts.bucket, data, objAPI); err != nil {
 		return err
 	}
 
-	globalReplicationPool.Get().resyncer.Lock()
-	defer globalReplicationPool.Get().resyncer.Unlock()
-	brs, ok := globalReplicationPool.Get().resyncer.statusMap[opts.bucket]
-	if !ok {
-		brs = BucketReplicationResyncStatus{
-			Version:    resyncMetaVersion,
-			TargetsMap: make(map[string]TargetReplicationResyncStatus),
-		}
-	}
-	brs.TargetsMap[opts.arn] = status
-	globalReplicationPool.Get().resyncer.statusMap[opts.bucket] = brs
-	go globalReplicationPool.Get().resyncer.resyncBucket(GlobalContext, objAPI, false, opts)
+	s.statusMap[opts.bucket] = data
+	go s.resyncBucket(GlobalContext, objAPI, false, opts)
 	return nil
 }
 
@@ -3200,6 +3637,9 @@ func (p *ReplicationPool) loadResync(ctx context.Context, buckets []string, objA
 	// Make sure only one node running resync on the cluster.
 	ctx, cancel := globalLeaderLock.GetLock(ctx)
 	defer cancel()
+	var workers sync.WaitGroup
+	// Keep the merged leader context alive until every resumed run exits.
+	defer workers.Wait()
 
 	for index := range buckets {
 		bucket := buckets[index]
@@ -3213,19 +3653,24 @@ func (p *ReplicationPool) loadResync(ctx context.Context, buckets []string, objA
 		}
 
 		p.resyncer.Lock()
-		p.resyncer.statusMap[bucket] = meta
-		p.resyncer.Unlock()
-
+		if current, ok := p.resyncer.statusMap[bucket]; ok {
+			// A concurrent start/cancel is newer than the disk snapshot.
+			meta = current
+		} else {
+			p.resyncer.statusMap[bucket] = meta
+		}
 		tgts := meta.cloneTgtStats()
+		p.resyncer.Unlock()
 		for arn, st := range tgts {
 			switch st.ResyncStatus {
 			case ResyncFailed, ResyncStarted, ResyncPending:
-				go p.resyncer.resyncBucket(ctx, objAPI, true, resyncOpts{
+				opts := resyncOpts{
 					bucket:       bucket,
 					arn:          arn,
 					resyncID:     st.ResyncID,
 					resyncBefore: st.ResyncBeforeDate,
-				})
+				}
+				workers.Go(func() { p.resyncer.resyncBucket(ctx, objAPI, true, opts) })
 			}
 		}
 	}
@@ -3448,9 +3893,10 @@ func queueReplicationHeal(ctx context.Context, bucket string, oi ObjectInfo, rcf
 				DeleteMarkerMTime:     DeleteMarkerMTime{roi.ModTime},
 				DeleteMarker:          roi.DeleteMarker,
 			},
-			Bucket:    roi.Bucket,
-			OpType:    replication.HealReplicationType,
-			EventType: ReplicateHealDelete,
+			Bucket:     roi.Bucket,
+			OpType:     replication.HealReplicationType,
+			EventType:  ReplicateHealDelete,
+			RetryCount: retryCount,
 		}
 		// heal delete marker replication failure or versioned delete replication failure
 		if roi.ReplicationStatus == replication.Pending ||
@@ -3544,6 +3990,7 @@ func (p *ReplicationPool) queueMRFSave(entry MRFReplicateEntry) {
 	if entry.RetryCount > mrfRetryLimit { // let scanner catch up if retry count exceeded
 		atomic.AddUint64(&p.stats.mrfStats.TotalDroppedCount, 1)
 		atomic.AddUint64(&p.stats.mrfStats.TotalDroppedBytes, uint64(entry.sz))
+		replLogOnceIf(GlobalContext, errors.New("Replication MRF retry limit reached; further repair is deferred to the scanner"), "replication-mrf-retry-limit", logger.WarningKind)
 		return
 	}
 
@@ -3558,6 +4005,7 @@ func (p *ReplicationPool) queueMRFSave(entry MRFReplicateEntry) {
 		default:
 			atomic.AddUint64(&p.stats.mrfStats.TotalDroppedCount, 1)
 			atomic.AddUint64(&p.stats.mrfStats.TotalDroppedBytes, uint64(entry.sz))
+			replLogOnceIf(GlobalContext, errors.New("Replication MRF queue is full; dropped entries will need scanner repair"), "replication-mrf-queue-full", logger.WarningKind)
 		}
 	}
 }
@@ -3731,7 +4179,12 @@ func (p *ReplicationPool) queueMRFHeal() error {
 				VersionID: vID,
 			})
 			cancel()
-			if err != nil {
+			// A versioned marker lookup returns its metadata with a 405. Only
+			// accept that error with a real, matching marker identity.
+			validMarker := isErrMethodNotAllowed(err) && oi.DeleteMarker &&
+				vID != "" && oi.VersionID == vID && !oi.ModTime.IsZero() &&
+				oi.Bucket == e.Bucket && oi.Name != "" && oi.Name == decodeDirObject(e.Object)
+			if err != nil && !validMarker || oi.Name == "" {
 				continue
 			}
 

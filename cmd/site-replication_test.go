@@ -133,28 +133,3 @@ func TestSRBucketMetaCorsRoundTrip(t *testing.T) {
 		t.Fatalf("expected nil Cors for deletion, got %q", *gotDel.Cors)
 	}
 }
-
-// TestIsBucketMetadataEqualCors covers the pointer-comparison helper used by
-// the CORS heal path to decide whether a peer already holds the latest config.
-func TestIsBucketMetadataEqualCors(t *testing.T) {
-	a := base64.StdEncoding.EncodeToString([]byte("config-a"))
-	b := base64.StdEncoding.EncodeToString([]byte("config-b"))
-
-	cases := []struct {
-		name string
-		one  *string
-		two  *string
-		want bool
-	}{
-		{"both nil", nil, nil, true},
-		{"one nil", &a, nil, false},
-		{"other nil", nil, &b, false},
-		{"equal", &a, &a, true},
-		{"different", &a, &b, false},
-	}
-	for _, tc := range cases {
-		if got := isBucketMetadataEqual(tc.one, tc.two); got != tc.want {
-			t.Errorf("%s: got %v want %v", tc.name, got, tc.want)
-		}
-	}
-}

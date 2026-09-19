@@ -418,6 +418,9 @@ func getReplicationState(rinfos replicatedInfos, prevState ReplicationState, vID
 
 	for _, rinfo := range rinfos.Targets {
 		if rinfo.ResyncTimestamp != "" {
+			if rs.ResetStatusesMap == nil {
+				rs.ResetStatusesMap = make(map[string]string)
+			}
 			rs.ResetStatusesMap[targetResetHeader(rinfo.Arn)] = rinfo.ResyncTimestamp
 		}
 	}
@@ -640,10 +643,10 @@ type VersionPurgeStatusType = replication.VersionPurgeStatusType
 
 type replicationResyncer struct {
 	// map of bucket to their resync status
-	statusMap      map[string]BucketReplicationResyncStatus
-	workerSize     int
-	resyncCancelCh chan struct{}
-	workerCh       chan struct{}
+	statusMap     map[string]BucketReplicationResyncStatus
+	workerSize    int
+	cancelResyncs map[resyncOpts]context.CancelCauseFunc
+	workerCh      chan struct{}
 	sync.RWMutex
 }
 

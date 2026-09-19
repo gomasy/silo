@@ -502,11 +502,15 @@ func (a adminAPIHandlers) AddUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	checkDenyOnly := accessKey == cred.AccessKey
+	action := policy.Action(policy.CreateUserAdminAction)
+	if checkDenyOnly {
+		action = policy.ChangeMyPasswordAdminAction
+	}
 
 	if !globalIAMSys.IsAllowed(policy.Args{
 		AccountName:     cred.AccessKey,
 		Groups:          cred.Groups,
-		Action:          policy.CreateUserAdminAction,
+		Action:          action,
 		ConditionValues: getConditionValues(r, "", cred),
 		IsOwner:         owner,
 		Claims:          cred.Claims,

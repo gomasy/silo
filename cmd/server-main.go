@@ -901,6 +901,8 @@ func serverMain(ctx *cli.Context) {
 		close(globalGridStart)
 		close(globalLockGridStart)
 
+		// The HTTP/1 listener preserves absolute header deadlines and renews the
+		// body read/write idle limits, so transfers may outlast IdleTimeout.
 		httpServer := xhttp.NewServer(getServerListenAddrs()).
 			UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 			UseTLSConfig(newTLSConfig(getCert)).

@@ -880,10 +880,40 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 }
 
 func (s *erasureSets) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result ListMultipartsInfo, err error) {
-	// In list multipart uploads we are going to treat input prefix as the object,
-	// this means that we are not supporting directory navigation.
-	set := s.getHashedSet(prefix)
-	return set.ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
+	if err := checkListMultipartArgs(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter); err != nil {
+		return ListMultipartsInfo{}, err
+	}
+	scan, err := startMultipartScan(ctx, false)
+	if err != nil {
+		return ListMultipartsInfo{}, err
+	}
+	defer scan.close()
+	uploads, legacy, err := s.scanMultipartUploads(scan, bucket, 0)
+	if err != nil {
+		return ListMultipartsInfo{}, err
+	}
+	if legacy {
+		return ListMultipartsInfo{}, errMultipartListingLegacy
+	}
+	return paginateMultipartUploads(uploads, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads), nil
+}
+
+func (s *erasureSets) scanMultipartUploads(scan *multipartScan, bucket string, poolIdx int) ([]MultipartInfo, bool, error) {
+	var uploads []MultipartInfo
+	var keyless bool
+	for i, set := range s.sets {
+		setUploads, setKeyless, err := set.scanMultipartUploads(scan, bucket, poolIdx, i)
+		if err != nil {
+			return nil, false, err
+		}
+		uploads = append(uploads, setUploads...)
+		keyless = keyless || setKeyless
+	}
+	return uploads, keyless, nil
+}
+
+func (s *erasureSets) listMultipartUploadsExact(ctx context.Context, bucket, object string) (ListMultipartsInfo, error) {
+	return s.getHashedSet(object).listMultipartUploadsExact(ctx, bucket, object, "", "", "", maxUploadsList)
 }
 
 // Initiate a new multipart upload on a hashedSet based on object name.

@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	miniogo "github.com/minio/minio-go/v7"
 	miniocredentials "github.com/minio/minio-go/v7/pkg/credentials"
@@ -51,7 +52,7 @@ func TestAPIFederatedUploadPartChecksumResponse(t *testing.T) {
 	})
 }
 
-func testAPIFederatedUploadPartChecksumResponse(_ ObjectLayer, instanceType, bucketName string,
+func testAPIFederatedUploadPartChecksumResponse(objectAPI ObjectLayer, instanceType, bucketName string,
 	apiRouter http.Handler, credentials auth.Credentials, t *testing.T,
 ) {
 	algorithms := []struct {
@@ -100,6 +101,18 @@ func testAPIFederatedUploadPartChecksumResponse(_ ObjectLayer, instanceType, buc
 				}
 				if got := rec.Header().Get(xhttp.AmzChecksumType); got != "" {
 					t.Fatalf("%s: UploadPart returned checksum type %q", instanceType, got)
+				}
+				modified := rec.Header().Get(federatedLastModified)
+				if userAgent.want {
+					parts, err := objectAPI.ListObjectParts(t.Context(), bucketName, object, uploadID, 0, 100, ObjectOptions{})
+					if err != nil || len(parts.Parts) != 1 {
+						t.Fatalf("stored part: %v, %v", parts, err)
+					}
+					if modified != parts.Parts[0].LastModified.UTC().Format(time.RFC3339Nano) {
+						t.Errorf("response time %q does not match committed part time %s", modified, parts.Parts[0].LastModified)
+					}
+				} else if modified != "" {
+					t.Errorf("ordinary UploadPart exposed federation timestamp %q", modified)
 				}
 			})
 		}
@@ -158,7 +171,7 @@ func TestAPIFederatedUploadPartChecksumConcurrentOverwrite(t *testing.T) {
 	})
 }
 
-func testAPIFederatedUploadPartChecksumConcurrentOverwrite(_ ObjectLayer, instanceType, bucketName string,
+func testAPIFederatedUploadPartChecksumConcurrentOverwrite(objectAPI ObjectLayer, instanceType, bucketName string,
 	apiRouter http.Handler, credentials auth.Credentials, t *testing.T,
 ) {
 	object := "federation/concurrent-overwrite"
@@ -194,6 +207,10 @@ func testAPIFederatedUploadPartChecksumConcurrentOverwrite(_ ObjectLayer, instan
 	}
 	close(start)
 	wg.Wait()
+	parts, err := objectAPI.ListObjectParts(t.Context(), bucketName, object, uploadID, 0, 100, ObjectOptions{})
+	if err != nil || len(parts.Parts) != 1 {
+		t.Fatalf("stored part: %v, %v", parts, err)
+	}
 
 	for i, rec := range recorders {
 		if rec.Code != http.StatusOK {
@@ -212,6 +229,13 @@ func testAPIFederatedUploadPartChecksumConcurrentOverwrite(_ ObjectLayer, instan
 		md5sum := md5.Sum(data[i])
 		if want := hex.EncodeToString(md5sum[:]); canonicalizeETag(etags[0]) != want {
 			t.Fatalf("%s: concurrent request %d ETag %q, want %q", instanceType, i, etags[0], want)
+		}
+		modified, err := time.Parse(time.RFC3339Nano, rec.Header().Get(federatedLastModified))
+		if err != nil || modified.IsZero() {
+			t.Fatalf("concurrent request %d returned invalid time %v: %v", i, modified, err)
+		}
+		if canonicalizeETag(etags[0]) == parts.Parts[0].ETag && !modified.Equal(parts.Parts[0].LastModified) {
+			t.Errorf("surviving part has time %s, its writer returned %s", parts.Parts[0].LastModified, modified)
 		}
 	}
 }
@@ -351,6 +375,9 @@ func testAPIFederatedCopyObjectPartChecksum(objectAPI ObjectLayer, instanceType,
 			parts := listPartsHTTP(t, apiRouter, credentials, remoteBucket, object, uploadID, nil)
 			if len(parts.Parts) != 1 {
 				t.Fatalf("%s: ListParts returned %d parts, want 1", instanceType, len(parts.Parts))
+			}
+			if response.LastModified != parts.Parts[0].LastModified {
+				t.Errorf("CopyPartResult time = %q, want stored part time %q", response.LastModified, parts.Parts[0].LastModified)
 			}
 			if got := partChecksum(algorithm.typ, parts.Parts[0]); got != want {
 				t.Fatalf("%s: persisted part %s is %q, want %q", instanceType, algorithm.typ.String(), got, want)

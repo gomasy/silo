@@ -184,6 +184,16 @@ func getAndValidateAttributesOpts(ctx context.Context, w http.ResponseWriter, r 
 		return opts, valid
 	}
 
+	// Reject out-of-range page sizes as ListObjectParts does, instead of
+	// answering an invalid request with an empty parts listing.
+	if opts.MaxParts < 0 {
+		apiErr = errorCodes.ToAPIErr(ErrInvalidMaxParts)
+		argumentName = strings.ToLower(xhttp.AmzMaxParts)
+		argumentValue = r.Header.Get(xhttp.AmzMaxParts)
+		valid = false
+		return opts, valid
+	}
+
 	if opts.MaxParts == 0 {
 		opts.MaxParts = maxPartsList
 	}
@@ -192,6 +202,14 @@ func getAndValidateAttributesOpts(ctx context.Context, w http.ResponseWriter, r 
 	if err != nil {
 		apiErr = toAPIError(ctx, err)
 		argumentName = strings.ToLower(xhttp.AmzPartNumberMarker)
+		valid = false
+		return opts, valid
+	}
+
+	if opts.PartNumberMarker < 0 {
+		apiErr = errorCodes.ToAPIErr(ErrInvalidPartNumberMarker)
+		argumentName = strings.ToLower(xhttp.AmzPartNumberMarker)
+		argumentValue = r.Header.Get(xhttp.AmzPartNumberMarker)
 		valid = false
 		return opts, valid
 	}
@@ -415,7 +433,16 @@ func putOptsFromHeaders(ctx context.Context, hdr http.Header, metadata map[strin
 		if err != nil {
 			return ObjectOptions{}, err
 		}
-		sseKms, err := encrypt.NewSSEKMS(keyID, context)
+		// kms.Context implements encoding.TextMarshaler, so handing it to the
+		// SDK's interface{} parameter would serialize the context as a JSON
+		// string, which the receiving ParseHTTP rejects; a nil Context is a
+		// typed nil there and would be sent as "{}". Pass a plain map, or
+		// nothing when no context was requested.
+		var sdkContext any
+		if context != nil {
+			sdkContext = map[string]string(context)
+		}
+		sseKms, err := encrypt.NewSSEKMS(keyID, sdkContext)
 		if err != nil {
 			return ObjectOptions{}, err
 		}
@@ -425,6 +452,11 @@ func putOptsFromHeaders(ctx context.Context, hdr http.Header, metadata map[strin
 			MTime:                mtime,
 			PreserveETag:         etag,
 			ReplicationRequest:   trustedReplication,
+			// These timestamps order replicated retention, legal hold and tagging
+			// updates on an SSE-KMS destination.
+			ReplicationSourceLegalholdTimestamp: lholdtimestmp,
+			ReplicationSourceRetentionTimestamp: retaintimestmp,
+			ReplicationSourceTaggingTimestamp:   taggingtimestmp,
 		}
 		return op, nil
 	}

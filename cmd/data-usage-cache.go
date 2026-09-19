@@ -981,6 +981,7 @@ func (d *dataUsageCache) save(ctx context.Context, store objectIO, name string) 
 // and write new data with the new version.
 const (
 	dataUsageCacheVerCurrent = 8
+	dataUsageCacheVerV9      = 9 // Retired access-tier cache; only adds the ignored "hts" entry key.
 	dataUsageCacheVerV7      = 7
 	dataUsageCacheVerV6      = 6
 	dataUsageCacheVerV5      = 5
@@ -1182,7 +1183,7 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 		}
 
 		return nil
-	case dataUsageCacheVerCurrent:
+	case dataUsageCacheVerCurrent, dataUsageCacheVerV9:
 		// Zstd compressed.
 		dec, err := zstd.NewReader(r, zstd.WithDecoderConcurrency(2))
 		if err != nil {

@@ -865,7 +865,7 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, b
 	if oi.isMultipart() {
 		res, err := z.NewMultipartUpload(ctx, bucket, oi.Name, ObjectOptions{
 			VersionID:    oi.VersionID,
-			UserDefined:  oi.UserDefined,
+			UserDefined:  migrationObjectMetadata(oi),
 			NoAuditLog:   true,
 			DataMovement: true,
 			SrcPoolIdx:   poolIdx,
@@ -924,7 +924,7 @@ func (z *erasureServerPools) rebalanceObject(ctx context.Context, poolIdx int, b
 			DataMovement: true,
 			VersionID:    oi.VersionID,
 			MTime:        oi.ModTime,
-			UserDefined:  oi.UserDefined,
+			UserDefined:  migrationObjectMetadata(oi),
 			PreserveETag: oi.ETag, // Preserve original ETag to ensure same metadata.
 			IndexCB: func() []byte {
 				return oi.Parts[0].Index // Preserve part Index to ensure decompression works.

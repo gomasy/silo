@@ -119,7 +119,7 @@ Only requests whose peer address matches this allowlist may supply forwarded cli
 
 The RFC 7239 `Forwarded` header is not used for this bucket; deployments that only send `Forwarded` fall back to the peer-address bucket.
 
-This allowlist governs LDAP STS rate-limit bucketing only. The client address used for `aws:SourceIp`, audit logs and event notifications is governed separately by `MINIO_API_TRUSTED_PROXIES` — see [Client source address trust](../security/source-address-trust.md). The two use the same list syntax and the same chain-walking rules, and in most deployments should be set to the same value. They differ deliberately in one respect: this setting prefers `X-Real-IP` over `X-Forwarded-For`, while `MINIO_API_TRUSTED_PROXIES` prefers the chain-validated `X-Forwarded-For`, because it decides access control rather than rate-limit bucketing. Neither order is safe for every proxy; the linked document explains the trade-off.
+This allowlist governs LDAP STS rate-limit bucketing only. The client address used for `aws:SourceIp`, audit logs and event notifications is governed separately by `MINIO_API_TRUSTED_PROXIES` — see [Client source address trust](https://silo.pgsty.com/reference/minio-server/settings/core/#client-source-address-trust). The two use the same list syntax and the same chain-walking rules, and in most deployments should be set to the same value. They differ deliberately in one respect: this setting prefers `X-Real-IP` over `X-Forwarded-For`, while `MINIO_API_TRUSTED_PROXIES` prefers the chain-validated `X-Forwarded-For`, because it decides access control rather than rate-limit bucketing. Neither order is safe for every proxy; the linked document explains the trade-off.
 
 ### Lookup-Bind
 

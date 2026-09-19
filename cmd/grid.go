@@ -51,9 +51,8 @@ func initGlobalGrid(ctx context.Context, eps EndpointServerPools) error {
 			grid.ContextDialer(xhttp.DialContextWithLookupHost(lookupHost, xhttp.NewInternodeDialContext(rest.DefaultTimeout, globalTCPOptions.ForWebsocket()))),
 			newCachedAuthToken(),
 			&tls.Config{
-				RootCAs:          globalRootCAs,
-				CipherSuites:     crypto.TLSCiphers(),
-				CurvePreferences: crypto.TLSCurveIDs(),
+				RootCAs:      globalRootCAs,
+				CipherSuites: crypto.TLSCiphers(),
 			}),
 		Local:        local,
 		Hosts:        hosts,
@@ -84,9 +83,8 @@ func initGlobalLockGrid(ctx context.Context, eps EndpointServerPools) error {
 			grid.ContextDialer(xhttp.DialContextWithLookupHost(lookupHost, xhttp.NewInternodeDialContext(rest.DefaultTimeout, globalTCPOptions.ForWebsocket()))),
 			newCachedAuthToken(),
 			&tls.Config{
-				RootCAs:          globalRootCAs,
-				CipherSuites:     crypto.TLSCiphers(),
-				CurvePreferences: crypto.TLSCurveIDs(),
+				RootCAs:      globalRootCAs,
+				CipherSuites: crypto.TLSCiphers(),
 			}, grid.RouteLockPath),
 		Local:        local,
 		Hosts:        hosts,

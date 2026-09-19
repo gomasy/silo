@@ -979,7 +979,10 @@ func testAPIGetObjectWithPartNumberHandler(obj ObjectLayer, instanceType, bucket
 			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
 		}
 
-		rs := partNumberToRangeSpec(oinfo, partNumber)
+		rs, err := partNumberToRangeSpec(oinfo, partNumber)
+		if err != nil {
+			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
+		}
 		size, err := oinfo.GetActualSize()
 		if err != nil {
 			t.Fatalf("Object: %s Object Index %d: Unexpected err: %v", object, oindex, err)
@@ -1796,6 +1799,12 @@ func testAPICopyObjectPartHandlerSanity(obj ObjectLayer, instanceType, bucketNam
 		req.Header.Set("X-Amz-Copy-Source", url.QueryEscape(pathJoin(bucketName, objectName)))
 		req.Header.Set("X-Amz-Copy-Source-Range", fmt.Sprintf("bytes=%d-%d", a, b))
 
+		// Re-sign so the copy-source x-amz-* headers are covered by the
+		// signature, as real clients do; the verifier rejects unsigned x-amz-*.
+		if err = signRequestV4(req, credentials.AccessKey, credentials.SecretKey); err != nil {
+			t.Fatalf("Test failed to re-sign HTTP request for copy object part: <ERROR> %v", err)
+		}
+
 		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler, `func (api objectAPIHandlers) CopyObjectHandler` handles the request.
 		a = globalMinPartSize + 1
@@ -2194,6 +2203,15 @@ func testAPICopyObjectPartHandler(obj ObjectLayer, instanceType, bucketName stri
 				req.Header.Set("X-Amz-Copy-Source-Range", "") // specifically test for S3 errors in this scenario.
 			} else {
 				req.Header.Set("X-Amz-Copy-Source-Range", testCase.copySourceRange)
+			}
+		}
+
+		// Re-sign so the copy-source x-amz-* headers set above are covered by
+		// the signature, as real clients do; the verifier rejects unsigned
+		// x-amz-* headers.
+		if testCase.accessKey != "" && testCase.secretKey != "" {
+			if err = signRequestV4(req, testCase.accessKey, testCase.secretKey); err != nil {
+				t.Fatalf("Test %d: Failed to re-sign HTTP request for copy Object: <ERROR> %v", i+1, err)
 			}
 		}
 
@@ -2622,6 +2640,16 @@ func testAPICopyObjectHandler(obj ObjectLayer, instanceType, bucketName string, 
 		}
 		if testCase.metadataGarbage {
 			req.Header.Set("X-Amz-Metadata-Directive", "Unknown")
+		}
+		// The x-amz-copy-source and related x-amz-* headers set above must be
+		// part of the SigV4 signature, exactly as real S3 clients send them.
+		// Re-sign now that they are present; the verifier rejects unsigned
+		// x-amz-* headers (an unsigned x-amz-copy-source could otherwise turn a
+		// PUT grant into a server-side copy).
+		if testCase.accessKey != "" && testCase.secretKey != "" {
+			if err = signRequestV4(req, testCase.accessKey, testCase.secretKey); err != nil {
+				t.Fatalf("Test %d: Failed to re-sign HTTP request for copy Object: <ERROR> %v", i, err)
+			}
 		}
 		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler, `func (api objectAPIHandlers) CopyObjectHandler` handles the request.

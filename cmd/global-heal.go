@@ -166,6 +166,12 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 	if objAPI == nil {
 		return errServerNotInitialized
 	}
+	healInPool := er.HealObject
+	if z, ok := objAPI.(*erasureServerPools); ok && !z.SinglePool() {
+		healInPool = func(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
+			return z.healObjectInPool(ctx, er, bucket, object, versionID, opts)
+		}
+	}
 
 	started := tracker.Started
 	if started.IsZero() || started.Equal(timeSentinel) {
@@ -419,7 +425,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			var result healEntryResult
 			fivs, err := entry.fileInfoVersions(bucket)
 			if err != nil {
-				res, err := er.HealObject(ctx, bucket, encodedEntryName, "",
+				res, err := healInPool(ctx, bucket, encodedEntryName, "",
 					madmin.HealOpts{
 						ScanMode: scanMode,
 						Remove:   healDeleteDangling,
@@ -455,7 +461,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 					continue
 				}
 
-				res, err := er.HealObject(ctx, bucket, encodedEntryName,
+				res, err := healInPool(ctx, bucket, encodedEntryName,
 					version.VersionID, madmin.HealOpts{
 						ScanMode: scanMode,
 						Remove:   healDeleteDangling,

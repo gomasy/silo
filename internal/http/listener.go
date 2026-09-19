@@ -70,7 +70,10 @@ func (listener *httpListener) Accept() (conn net.Conn, err error) {
 		if result.err != nil {
 			return nil, result.err
 		}
-		return deadlineconn.New(result.conn).WithReadDeadline(listener.opts.IdleTimeout).WithWriteDeadline(listener.opts.IdleTimeout), result.err
+		conn := deadlineconn.New(result.conn).WithReadDeadline(listener.opts.IdleTimeout).WithWriteDeadline(listener.opts.IdleTimeout)
+		// Server.Init switches to rolling reads only after HTTP/1 headers are read.
+		conn.SetReadDeadlineStrict(true)
+		return conn, nil
 	case <-listener.ctxDoneCh:
 	}
 	return nil, syscall.EINVAL

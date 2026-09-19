@@ -35,7 +35,7 @@ set -e
 export MINIO_CI_CD=1
 export MINIO_BROWSER=off
 export MINIO_ROOT_USER="minio"
-export MINIO_ROOT_PASSWORD="silo123"
+export MINIO_ROOT_PASSWORD="silo12345"
 export MINIO_KMS_AUTO_ENCRYPTION=off
 export MINIO_PROMETHEUS_AUTH_TYPE=public
 export MINIO_KMS_SECRET_KEY=my-minio-key:OSMM+vkKUTCvQs9YL/CVMIMt43HFhkUpqJxTmGl6rYw=
@@ -70,10 +70,10 @@ silo server --address 127.0.0.1:9008 "http://127.0.0.1:9007/tmp/multisited/data/
 
 # Wait to make sure all Silo instances are up
 
-export MC_HOST_sitea=http://minio:silo123@127.0.0.1:9001
-export MC_HOST_siteb=http://minio:silo123@127.0.0.1:9004
-export MC_HOST_sitec=http://minio:silo123@127.0.0.1:9006
-export MC_HOST_sited=http://minio:silo123@127.0.0.1:9008
+export MC_HOST_sitea=http://minio:silo12345@127.0.0.1:9001
+export MC_HOST_siteb=http://minio:silo12345@127.0.0.1:9004
+export MC_HOST_sitec=http://minio:silo12345@127.0.0.1:9006
+export MC_HOST_sited=http://minio:silo12345@127.0.0.1:9008
 
 ./mc ready sitea
 ./mc ready siteb
@@ -89,7 +89,7 @@ export MC_HOST_sited=http://minio:silo123@127.0.0.1:9008
 sleep 10s
 
 ## Add warm tier
-./mc ilm tier add minio sitea WARM-TIER --endpoint http://localhost:9006 --access-key minio --secret-key silo123 --bucket bucket
+./mc ilm tier add minio sitea WARM-TIER --endpoint http://localhost:9006 --access-key minio --secret-key silo12345 --bucket bucket
 
 ## Add ILM rules
 ./mc ilm add sitea/bucket --transition-days 0 --transition-tier WARM-TIER --transition-days 0 --noncurrent-expire-days 2 --expire-days 3 --prefix "myprefix" --tags "tag1=val1&tag2=val2"

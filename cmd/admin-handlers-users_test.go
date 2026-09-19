@@ -243,6 +243,7 @@ func TestIAMInternalIDPServerSuite(t *testing.T) {
 
 				suite.SetUpSuite(c)
 				suite.TestUserCreate(c)
+				suite.TestUserPasswordActionAuthorization(c)
 				suite.TestUserStatusActionAuthorization(c)
 				suite.TestGroupStatusActionAuthorization(c)
 				suite.TestUserPolicyEscalationBug(c)
@@ -353,6 +354,106 @@ func (s *TestSuiteIAM) TestUserCreate(c *check) {
 	err = client.MakeBucket(ctx, getRandomBucketName(), minio.MakeBucketOptions{})
 	if err == nil {
 		c.Fatalf("user account was not deleted!")
+	}
+}
+
+func (s *TestSuiteIAM) TestUserPasswordActionAuthorization(c *check) {
+	for _, tt := range []struct {
+		name       string
+		statements string
+		self       bool
+		other      bool
+	}{
+		{"readonly", "", true, false},
+		{"consolereadonly", "", true, false},
+		{"password grant", `{"Effect":"Allow","Action":"admin:ChangeMyPassword"}`, true, false},
+		{"legacy CreateUser deny", `{"Effect":"Deny","Action":"admin:CreateUser","Resource":"arn:aws:s3:::*"}`, true, false},
+		{"password deny", `{"Effect":"Deny","Action":"admin:ChangeMyPassword"}`, false, false},
+		{"user admin", `{"Effect":"Allow","Action":"admin:CreateUser"}`, true, true},
+		{"user admin with password deny", `{"Effect":"Allow","Action":"admin:CreateUser"},{"Effect":"Deny","Action":"admin:ChangeMyPassword"}`, false, true},
+		{"password deny overrides grant", `{"Effect":"Allow","Action":"admin:ChangeMyPassword"},{"Effect":"Deny","Action":"admin:ChangeMyPassword"}`, false, false},
+		{"wildcard deny", `{"Effect":"Deny","Action":"admin:*"}`, false, false},
+	} {
+		c.Run(tt.name, func(t *testing.T) {
+			c := &check{t, s.serverType}
+			ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+			defer cancel()
+			var users []string
+			policyName := tt.name
+			defer func() {
+				for _, user := range users {
+					if err := s.adm.RemoveUser(ctx, user); err != nil {
+						c.Errorf("remove test user: %v", err)
+					}
+				}
+				if tt.statements != "" {
+					if err := s.adm.RemoveCannedPolicy(ctx, policyName); err != nil {
+						c.Errorf("remove test policy: %v", err)
+					}
+				}
+			}()
+			createUser := func() (string, string) {
+				accessKey, secretKey := mustGenerateCredentials(c)
+				if err := s.adm.SetUser(ctx, accessKey, secretKey, madmin.AccountEnabled); err != nil {
+					c.Fatalf("create test user: %v", err)
+				}
+				users = append(users, accessKey)
+				return accessKey, secretKey
+			}
+			client := func(accessKey, secretKey string) *madmin.AdminClient {
+				adm, err := madmin.New(s.endpoint, accessKey, secretKey, s.secure)
+				if err != nil {
+					c.Fatal(err)
+				}
+				adm.SetCustomTransport(s.TestSuiteCommon.client.Transport)
+				return adm
+			}
+			if tt.statements != "" {
+				policyName = getRandomBucketName()
+				doc := []byte(`{"Version":"2012-10-17","Statement":[` + tt.statements + `]}`)
+				if err := s.adm.AddCannedPolicy(ctx, policyName, doc); err != nil {
+					c.Fatalf("save test policy: %v", err)
+				}
+			}
+			accessKey, secretKey := createUser()
+			if _, err := s.adm.AttachPolicy(ctx, madmin.PolicyAssociationReq{
+				User: accessKey, Policies: []string{policyName},
+			}); err != nil {
+				c.Fatalf("attach test policy: %v", err)
+			}
+			adm := client(accessKey, secretKey)
+			_, newSecretKey := mustGenerateCredentials(c)
+			err := adm.SetUser(ctx, accessKey, newSecretKey, madmin.AccountEnabled)
+			if tt.self {
+				if err != nil {
+					c.Fatalf("change own password: %v", err)
+				}
+				if _, err = adm.AccountInfo(ctx, madmin.AccountOpts{}); err == nil {
+					c.Fatal("old password still authenticates")
+				}
+				adm = client(accessKey, newSecretKey)
+			} else if err == nil || madmin.ToErrorResponse(err).Code != "AccessDenied" {
+				c.Fatalf("self password change: expected AccessDenied, got %v", err)
+			}
+			if _, err := adm.AccountInfo(ctx, madmin.AccountOpts{}); err != nil {
+				c.Fatalf("current password no longer authenticates: %v", err)
+			}
+			target, _ := createUser()
+			newUser, newUserSecret := mustGenerateCredentials(c)
+			for _, key := range []string{target, newUser} {
+				err := adm.SetUser(ctx, key, newUserSecret, madmin.AccountEnabled)
+				if tt.other {
+					if err != nil {
+						c.Fatalf("create or update another user: %v", err)
+					}
+					if key == newUser {
+						users = append(users, newUser)
+					}
+				} else if err == nil || madmin.ToErrorResponse(err).Code != "AccessDenied" {
+					c.Fatalf("create or update another user: expected AccessDenied, got %v", err)
+				}
+			}
+		})
 	}
 }
 
@@ -946,6 +1047,7 @@ func (s *TestSuiteIAM) TestCannedPolicies(c *check) {
 	defaultPolicies := []string{
 		"readwrite",
 		"readonly",
+		"consolereadonly",
 		"writeonly",
 		"diagnostics",
 		"consoleAdmin",

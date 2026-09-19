@@ -77,11 +77,22 @@ test evidence, compatibility notes, and documentation impact. Public product
 documentation is owned by the separate
 [`pgsty/silo.pgsty.com`](https://github.com/pgsty/silo.pgsty.com) repository.
 
+## Contributor recognition
+
+Every human issue or pull-request author is recognized in [CONTRIBUTORS.md](CONTRIBUTORS.md),
+including open issues, draft PRs, and PRs closed without merging. Merged fixes,
+adopted proposals, and reports that lead to fixes receive greater prominence;
+first participation guides the remaining order. Work incorporated through a
+later PR retains credit without changing the original PR's recorded status.
+Security disclosures are credited with the reporter's agreement. DCO sign-off
+applies to code commits, not to opening an issue.
+
 ## Licensing of Contributions
 
-Silo is licensed under the [GNU AGPL v3.0 or later](LICENSE). Its core is
-Copyright (c) MinIO, Inc.; the combined work can never be relicensed, and this
-fork does not try to.
+Code contributions to PGSTY SILO (`pgsty/silo`) are accepted under the
+[GNU AGPL v3.0 or later](LICENSE), the same license as the server. Submit issues
+and pull requests to this repository's maintainers. No separate Apache-2.0
+license grant to SILO or upstream MinIO maintainers is required.
 
 * **No CLA.** We do not ask you to sign a Contributor License Agreement and we
   do not take your copyright. Contributions are accepted inbound=outbound: you
@@ -112,14 +123,19 @@ fork does not try to.
   `Signed-off-by` trailers) and add your own sign-off as the person passing it
   along. Never import code from a proprietary distribution.
 
-* **File headers.** Files derived from upstream keep the original MinIO
-  copyright header unchanged. New files added by this fork use the dual
-  header, followed by the standard AGPL boilerplate:
+* **File headers.** Preserve existing copyright and license notices in inherited
+  and third-party files. New original files name their actual copyright holders
+  and use AGPL-3.0-or-later. Use a header such as the following, then append the
+  standard AGPL boilerplate:
 
   ```
-  // Copyright (c) 2015-2025 MinIO, Inc.
-  // Copyright (c) 2025-2026 PGSTY
+  // Copyright (c) 2026 Your Name
   ```
+
+* **Separately licensed material.** Documentation contributions in `docs/`
+  follow its existing [CC BY 4.0 license](docs/LICENSE). Third-party components
+  and earlier Apache-2.0 contributions retain their original licenses and
+  attribution; this policy does not relicense earlier work.
 
 * **Squash merges** must keep the `Signed-off-by:` trailers in the resulting
   commit message.

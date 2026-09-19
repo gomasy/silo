@@ -204,16 +204,24 @@ func (sm *siteResyncMetrics) updateState(s SiteResyncStatus) error {
 	switch s.Status {
 	case ResyncStarted:
 		sm.peerResyncMap[s.DeplID] = resyncState{resyncID: s.ResyncID, LastSaved: time.Time{}}
-		sm.resyncStatus[s.ResyncID] = s
+		sm.resyncStatus[s.ResyncID] = s.clone()
 	case ResyncCompleted, ResyncCanceled, ResyncFailed:
 		st, ok := sm.resyncStatus[s.ResyncID]
 		if ok {
 			st.LastUpdate = s.LastUpdate
 			st.Status = s.Status
+			if s.Status == ResyncCanceled {
+				for bucket, status := range st.BucketStatuses {
+					if status == ResyncPending || status == ResyncStarted {
+						st.BucketStatuses[bucket] = ResyncCanceled
+					}
+				}
+			}
+			sm.resyncStatus[s.ResyncID] = st
 			return nil
 		}
-		sm.resyncStatus[s.ResyncID] = st
-		return saveSiteResyncMetadata(GlobalContext, st, newObjectLayerFn())
+		sm.resyncStatus[s.ResyncID] = s.clone()
+		return saveSiteResyncMetadata(GlobalContext, s, newObjectLayerFn())
 	}
 	return nil
 }
@@ -230,7 +238,15 @@ func (sm *siteResyncMetrics) incBucket(o resyncOpts, bktStatus ResyncStatusType)
 		if st.BucketStatuses == nil {
 			st.BucketStatuses = map[string]ResyncStatusType{}
 		}
+		if st.BucketStatuses[o.bucket] == ResyncCanceled {
+			return
+		}
 		switch bktStatus {
+		case ResyncCanceled:
+			st.BucketStatuses[o.bucket] = ResyncCanceled
+			st.Status = ResyncCanceled
+			st.LastUpdate = UTCNow()
+			sm.resyncStatus[o.resyncID] = st
 		case ResyncCompleted:
 			st.BucketStatuses[o.bucket] = ResyncCompleted
 			st.Status = siteResyncStatus(st.Status, st.BucketStatuses)

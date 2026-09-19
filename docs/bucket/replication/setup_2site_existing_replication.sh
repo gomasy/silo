@@ -35,7 +35,7 @@ set -e
 export MINIO_CI_CD=1
 export MINIO_BROWSER=off
 export MINIO_ROOT_USER="minio"
-export MINIO_ROOT_PASSWORD="silo123"
+export MINIO_ROOT_PASSWORD="silo12345"
 export MINIO_KMS_AUTO_ENCRYPTION=off
 export MINIO_PROMETHEUS_AUTH_TYPE=public
 export MINIO_KMS_SECRET_KEY=my-minio-key:OSMM+vkKUTCvQs9YL/CVMIMt43HFhkUpqJxTmGl6rYw=
@@ -58,8 +58,8 @@ silo server --address 127.0.0.1:9003 "http://127.0.0.1:9003/tmp/multisiteb/data/
 silo server --address 127.0.0.1:9004 "http://127.0.0.1:9003/tmp/multisiteb/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9004/tmp/multisiteb/data/disterasure/xl{5...8}" >/tmp/siteb_2.log 2>&1 &
 
-export MC_HOST_sitea=http://minio:silo123@127.0.0.1:9001
-export MC_HOST_siteb=http://minio:silo123@127.0.0.1:9004
+export MC_HOST_sitea=http://minio:silo12345@127.0.0.1:9001
+export MC_HOST_siteb=http://minio:silo12345@127.0.0.1:9004
 
 ./mc ready sitea
 ./mc ready siteb
@@ -83,7 +83,7 @@ done
 
 echo "adding replication rule for site a -> site b"
 ./mc replicate add sitea/bucket/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9004/bucket
+	--remote-bucket http://minio:silo12345@127.0.0.1:9004/bucket
 
 remote_arn=$(./mc replicate ls sitea/bucket --json | jq -r .rule.Destination.Bucket)
 sleep 1
@@ -137,7 +137,7 @@ fi
 
 echo "adding replication rule for site a -> site b"
 ./mc replicate add sitea/bucket-version/ \
-	--remote-bucket http://minio:silo123@127.0.0.1:9004/bucket-version
+	--remote-bucket http://minio:silo12345@127.0.0.1:9004/bucket-version
 
 ./mc mb sitea/bucket-version/directory/
 

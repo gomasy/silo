@@ -23,6 +23,10 @@ import (
 )
 
 func prepareErasurePools() (ObjectLayer, []string, error) {
+	return prepareErasurePoolsWithContext(context.Background())
+}
+
+func prepareErasurePoolsWithContext(ctx context.Context) (ObjectLayer, []string, error) {
 	nDisks := 32
 	fsDirs, err := getRandomDisks(nDisks)
 	if err != nil {
@@ -32,7 +36,7 @@ func prepareErasurePools() (ObjectLayer, []string, error) {
 	pools := mustGetPoolEndpoints(0, fsDirs[:16]...)
 	pools = append(pools, mustGetPoolEndpoints(1, fsDirs[16:]...)...)
 
-	objLayer, _, err := initObjectLayer(context.Background(), pools)
+	objLayer, _, err := initObjectLayer(ctx, pools)
 	if err != nil {
 		removeRoots(fsDirs)
 		return nil, nil, err

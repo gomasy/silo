@@ -7,6 +7,9 @@ assignees: ''
 
 ---
 
+Suggest improvements to the PGSTY SILO server (`pgsty/silo`) here.
+For patches, see the [contribution guide](https://github.com/pgsty/silo/blob/main/CONTRIBUTING.md).
+
 **Is your feature request related to a problem? Please describe.**
 A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
 

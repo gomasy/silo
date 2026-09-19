@@ -70,9 +70,3 @@ func TLSCiphersBackwardCompatible() []uint16 {
 		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
 	}
 }
-
-// TLSCurveIDs returns a list of supported elliptic curve IDs
-// in preference order.
-func TLSCurveIDs() []tls.CurveID {
-	return []tls.CurveID{tls.X25519MLKEM768, tls.CurveP256, tls.X25519, tls.CurveP384, tls.CurveP521}
-}

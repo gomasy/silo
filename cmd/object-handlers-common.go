@@ -28,12 +28,51 @@ import (
 
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 )
 
 var etagRegex = regexp.MustCompile("\"*?([^\"]*?)\"*?$")
+
+// federatedLastModified carries the committed object/part time on the write
+// response. HTTP Date is a response time and Last-Modified loses subsecond
+// precision, so neither can supply CopyObject/UploadPartCopy's timestamp.
+const federatedLastModified = "X-Minio-Last-Modified"
+
+type federatedWriteTimeKey struct{}
+
+// withFederatedWriteTime allocates one result per SDK operation. SDK retries
+// run sequentially with this context; concurrent copies never share the result.
+func withFederatedWriteTime(ctx context.Context) (context.Context, *time.Time) {
+	modified := new(time.Time)
+	return context.WithValue(ctx, federatedWriteTimeKey{}, modified), modified
+}
+
+type federatedWriteTransport struct {
+	http.RoundTripper
+}
+
+func (t federatedWriteTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := t.RoundTripper.RoundTrip(r)
+	if modified, ok := r.Context().Value(federatedWriteTimeKey{}).(*time.Time); ok && r.Method == http.MethodPut {
+		// Replace on every attempt, including a success from an older target
+		// without the header. Never retain a failed attempt's timestamp or fail
+		// a committed write just because its timestamp is unavailable.
+		*modified = time.Time{}
+		if err == nil && resp != nil && resp.StatusCode == http.StatusOK {
+			*modified, _ = time.Parse(time.RFC3339Nano, resp.Header.Get(federatedLastModified))
+		}
+	}
+	return resp, err
+}
+
+func setFederatedWriteTime(w http.ResponseWriter, r *http.Request, modified time.Time) {
+	if isFederatedInternalRequest(r.UserAgent()) && !modified.IsZero() {
+		w.Header().Set(federatedLastModified, modified.UTC().Format(time.RFC3339Nano))
+	}
+}
 
 // Validates the preconditions for CopyObjectPart, returns true if CopyObjectPart
 // operation should not proceed. Preconditions supported are:
@@ -193,7 +232,18 @@ func checkPreconditionsPUT(ctx context.Context, w http.ResponseWriter, r *http.R
 
 	etagMatch := opts.PreserveETag != "" && isETagEqual(objInfo.ETag, opts.PreserveETag)
 	vidMatch := opts.VersionID != "" && opts.VersionID == objInfo.VersionID
-	if etagMatch && vidMatch {
+	// A matching version and ETag normally mean the destination already holds
+	// this version, so the write is skipped. They do not establish that for an
+	// authenticated SSE-C replica write: the destination cannot decrypt or
+	// re-encrypt the body without the customer key, so it cannot verify the
+	// replica, and this retransmission is how such a replica is repaired or
+	// updated. The predicate is the incoming request's restored SSE-C metadata,
+	// not what the destination happens to hold.
+	ssecReplica := isReplicaTrusted(r.Context()) && crypto.SSEC.IsEncrypted(opts.UserDefined)
+	// Matching content does not imply that its tag revision was delivered.
+	// Keep client preconditions above; relax only the internal duplicate check.
+	newerTags := isReplicaTrusted(r.Context()) && olderThan(objInfo.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp], opts.ReplicationSourceTaggingTimestamp)
+	if etagMatch && vidMatch && !ssecReplica && !newerTags {
 		writeHeaders()
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPreconditionFailed), r.URL)
 		return true
@@ -338,6 +388,28 @@ func ifModifiedSince(objTime time.Time, givenTime time.Time) bool {
 // if any present
 func canonicalizeETag(etag string) string {
 	return etagRegex.ReplaceAllString(etag, "$1")
+}
+
+// deleteIfMatchPreconditionFailed reports whether the If-Match precondition on a
+// DeleteObject request fails, in which case the delete must be refused with 412.
+// It is pure and never writes to the ResponseWriter: DeleteObject may evaluate
+// the precondition off the request goroutine (e.g. during multi-pool cleanup).
+//
+//   - A delete marker (a non-live latest version) has no entity-tag to match, so
+//     any If-Match value, including "*", fails against it.
+//   - "*" matches any existing live object, so it only requires existence.
+//   - A concrete ETag is compared against the object's public ETag. For
+//     SSE-C/SSE-KMS objects the public ETag is derived from the stored suffix
+//     without the customer key (getDecryptedETag), so a satisfiable condition is
+//     never rejected merely because the caller did not supply the key.
+func deleteIfMatchPreconditionFailed(h http.Header, ifMatch string, oi ObjectInfo) bool {
+	if oi.DeleteMarker {
+		return true
+	}
+	if strings.TrimSpace(ifMatch) == "*" {
+		return false
+	}
+	return !isETagEqual(getDecryptedETag(h, oi, false), ifMatch)
 }
 
 // isETagEqual return true if the canonical representations of two ETag strings

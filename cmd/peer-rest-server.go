@@ -204,7 +204,9 @@ func (s *peerRESTServer) DeleteServiceAccountHandler(mss *grid.MSS) (np grid.NoP
 		return np, grid.NewRemoteErr(errors.New("service account name is missing"))
 	}
 
-	if err := globalIAMSys.DeleteServiceAccount(context.Background(), accessKey, false); err != nil {
+	ctx, cancel := context.WithTimeout(GlobalContext, defaultContextTimeout)
+	defer cancel()
+	if err := globalIAMSys.LoadServiceAccount(ctx, accessKey); err != nil {
 		return np, grid.NewRemoteErr(err)
 	}
 
@@ -230,7 +232,8 @@ func (s *peerRESTServer) LoadServiceAccountHandler(mss *grid.MSS) (np grid.NoPay
 	return np, nerr
 }
 
-// DeleteUserHandler - deletes a user on the server.
+// DeleteUserHandler reloads the state committed by another node. A delayed
+// notification must not delete an identity recreated since that commit.
 func (s *peerRESTServer) DeleteUserHandler(mss *grid.MSS) (np grid.NoPayload, nerr *grid.RemoteErr) {
 	objAPI := newObjectLayerFn()
 	if objAPI == nil {
@@ -242,7 +245,9 @@ func (s *peerRESTServer) DeleteUserHandler(mss *grid.MSS) (np grid.NoPayload, ne
 		return np, grid.NewRemoteErr(errors.New("username is missing"))
 	}
 
-	if err := globalIAMSys.DeleteUser(context.Background(), accessKey, false); err != nil {
+	ctx, cancel := context.WithTimeout(GlobalContext, defaultContextTimeout)
+	defer cancel()
+	if err := globalIAMSys.LoadUserAfterDelete(ctx, accessKey); err != nil {
 		return np, grid.NewRemoteErr(err)
 	}
 
@@ -271,7 +276,9 @@ func (s *peerRESTServer) LoadUserHandler(mss *grid.MSS) (np grid.NoPayload, nerr
 		userType = stsUser
 	}
 
-	if err = globalIAMSys.LoadUser(context.Background(), objAPI, accessKey, userType); err != nil {
+	ctx, cancel := context.WithTimeout(GlobalContext, defaultContextTimeout)
+	defer cancel()
+	if err = globalIAMSys.LoadUser(ctx, objAPI, accessKey, userType); err != nil {
 		return np, grid.NewRemoteErr(err)
 	}
 
@@ -544,6 +551,17 @@ func (s *peerRESTServer) LoadBucketMetadataHandler(mss *grid.MSS) (np grid.NoPay
 		return np, grid.NewRemoteErr(err)
 	}
 
+	// Publish the reloaded metadata unconditionally. Overlapping peer reloads
+	// may briefly leave the resident cache a revision behind, or momentarily
+	// apply an older reload's derived registries. The resident cache may lag
+	// until another authoritative update advances it; the periodic metadata
+	// refresh is only best-effort here and cannot repair a divergence whose
+	// maximum per-config timestamp already equals the resident record's (its
+	// staleness check compares the same lastUpdate() and would see no change).
+	// This acceptable-until-refresh behavior is deliberate: lastUpdate() is the
+	// max of per-config timestamps and cannot order whole-record revisions, so a
+	// publication guard keyed on it would wrongly reject legitimately newer
+	// records (issue #105 follow-up dropped that guard).
 	globalBucketMetadataSys.Set(bucketName, meta)
 
 	if meta.notificationConfig != nil {

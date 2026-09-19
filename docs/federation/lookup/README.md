@@ -1,6 +1,34 @@
 # Federation Quickstart Guide *Federation feature is deprecated and should be avoided for future deployments*
 
+The maintained [federated CopyObject design](https://silo.pgsty.com/blog/design/federated-copy-object/) records the destination encryption, checksum, Object Lock and committed-response contract, including its Server release boundary.
+
 This document explains how to configure Silo with `Bucket lookup from DNS` style federation.
+
+## Cross-deployment copy behavior
+
+Federated `CopyObject` and `UploadPartCopy` forward the write to the destination
+deployment. Updated Silo destinations return the modification time of that
+committed object or part in `X-Minio-Last-Modified` (UTC RFC 3339 with nanosecond
+precision), alongside its ETag and checksums. The proxy uses that write response
+to populate the copy result, whose XML retains millisecond precision. This works
+for unversioned and versioned objects and encrypted writes, without an additional
+HEAD or ListParts request or additional read permissions at the destination.
+
+Both deployments need this change for accurate copy timestamps. If an older
+destination omits the header, or an intermediary removes or corrupts it, the copy
+still succeeds and retains the historical zero `LastModified` value
+(`0001-01-01T00:00:00.000Z`). The proxy neither substitutes its own clock or HTTP
+`Date` nor reports a committed write as failed because its timestamp is missing.
+The header is a response hint for the existing federation User-Agent token; it
+does not grant replication privileges.
+
+A replica-authorized `CopyObject` of a raw SSE-C source across deployments is
+unsupported and returns HTTP 501 `NotImplemented` before forwarding any request.
+This includes empty objects, which previously succeeded accidentally, and applies
+whether or not a copy-source key is supplied. Ordinary federated SSE-C copies
+with the source key, local SSE-C key rotation, bucket replication via PUT or
+multipart upload, and the separate `UploadPartCopy` operation retain their
+existing behavior.
 
 ## Get started
 

@@ -7,7 +7,7 @@ Silo-specific fixes or release notes.
 ## Supported Versions
 
 Security fixes are tracked on the active development branch and summarized in
-[docs/security/advisories.md](docs/security/advisories.md). Only the current
+[the security advisory ledger](https://silo.pgsty.com/about/security-advisories/). Only the current
 Silo release line is supported unless an advisory says otherwise.
 
 ## Inherited Fix Evidence
@@ -26,7 +26,7 @@ separately even when the fork preserves the original commit object and SHA.
   The inherited [service-account](https://github.com/pgsty/silo/blob/c1a49490c78e9c3ebcad86ba0662319138ace190/cmd/admin-handlers-users_test.go#L211-L212)
   and [STS](https://github.com/pgsty/silo/blob/c1a49490c78e9c3ebcad86ba0662319138ace190/cmd/sts-handlers_test.go#L45-L46)
   regression groups remain part of `go test ./cmd`; see the
-  [canonical ledger](docs/security/advisories.md#inherited-upstream-advisory-baseline)
+  [canonical ledger](https://silo.pgsty.com/about/security-advisories/#inherited)
   for the operator-facing record.
 
 ## Reporting a Vulnerability
@@ -42,4 +42,4 @@ For vulnerabilities in this fork:
 
 ## Disclosure Process
 
-Fork-specific fixes and user-visible upgrade notes are published in [docs/security/advisories.md](docs/security/advisories.md). The fork-specific triage and remediation process is described in [VULNERABILITY_REPORT.md](VULNERABILITY_REPORT.md).
+Fork-specific fixes and user-visible upgrade notes are published in [the security advisory ledger](https://silo.pgsty.com/about/security-advisories/). The fork-specific triage and remediation process is described in [VULNERABILITY_REPORT.md](VULNERABILITY_REPORT.md).

@@ -162,6 +162,15 @@ func (sys *IAMSys) LoadUser(ctx context.Context, objAPI ObjectLayer, accessKey s
 	return sys.store.UserNotificationHandler(ctx, accessKey, userType)
 }
 
+// LoadUserAfterDelete reloads a parent's identity and cached dependents after a
+// sibling committed a deletion. Each record may already have been recreated.
+func (sys *IAMSys) LoadUserAfterDelete(ctx context.Context, accessKey string) error {
+	if !sys.Initialized() {
+		return errServerNotInitialized
+	}
+	return sys.store.UserDeletionNotificationHandler(ctx, accessKey)
+}
+
 // LoadServiceAccount - reloads a specific service account from backend disks or etcd.
 func (sys *IAMSys) LoadServiceAccount(ctx context.Context, accessKey string) error {
 	if !sys.Initialized() {
@@ -596,10 +605,22 @@ func (sys *IAMSys) DeletePolicy(ctx context.Context, policyName string, notifyPe
 		return errServerNotInitialized
 	}
 
-	for _, v := range policy.DefaultPolicies {
-		if v.Name == policyName {
-			if err := checkConfig(ctx, globalObjectAPI, getPolicyDocPath(policyName)); err != nil && err == errConfigNotFound {
-				return fmt.Errorf("inbuilt policy `%s` not allowed to be deleted", policyName)
+	if _, replicated := iamReplicationTime(ctx); !replicated && notifyPeers {
+		for _, v := range policy.DefaultPolicies {
+			if v.Name == policyName {
+				var err error
+				if objectStore, ok := sys.store.IAMStorageAPI.(*IAMObjectStore); ok {
+					err = checkConfig(ctx, objectStore.objAPI, getPolicyDocPath(policyName))
+				} else {
+					var r iamRevision
+					err = sys.store.loadIAMConfig(ctx, &r, getPolicyDocPath(policyName))
+				}
+				if errors.Is(err, errConfigNotFound) {
+					return fmt.Errorf("inbuilt policy `%s` not allowed to be deleted", policyName)
+				}
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -705,20 +726,30 @@ func (sys *IAMSys) DeleteUser(ctx context.Context, accessKey string, notifyPeers
 		return errServerNotInitialized
 	}
 
-	if err := sys.store.DeleteUser(ctx, accessKey, regUser); err != nil {
+	err := sys.store.DeleteUser(ctx, accessKey, regUser)
+	var cleanupErr *iamCommittedCleanupError
+	retained := errors.Is(err, errIAMRevocationRetained)
+	if errors.As(err, &cleanupErr) {
+		retained = cleanupErr.retained
+	} else if err != nil && !retained {
 		return err
 	}
-
-	// Notify all other MinIO peers to delete user.
+	// Publish the committed state even when dependent cleanup must be retried.
 	if notifyPeers && !sys.HasWatcher() {
-		for _, nerr := range globalNotificationSys.DeleteUser(ctx, accessKey) {
-			if nerr.Err != nil {
-				logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
-				iamLogIf(ctx, nerr.Err)
+		if retained {
+			sys.notifyForUser(ctx, accessKey, false)
+		} else {
+			for _, nerr := range globalNotificationSys.DeleteUser(ctx, accessKey) {
+				if nerr.Err != nil {
+					logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+					iamLogIf(ctx, nerr.Err)
+				}
 			}
 		}
 	}
-
+	if cleanupErr != nil {
+		return cleanupErr
+	}
 	return nil
 }
 
@@ -1052,6 +1083,7 @@ type newServiceAccountOpts struct {
 	sessionPolicy              *policy.Policy
 	accessKey                  string
 	secretKey                  string
+	status                     string // Used by replication snapshots; local creates default to enabled.
 	name, description          string
 	expiration                 *time.Time
 	allowSiteReplicatorAccount bool // allow creating internal service account for site-replication.
@@ -1116,6 +1148,11 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 			m[k] = v
 		}
 	}
+	if _, replicated := iamReplicationTime(ctx); !replicated {
+		if err := setIAMParentRevocationClaim(ctx, sys.store, parentUser, m); err != nil {
+			return auth.Credentials{}, time.Time{}, err
+		}
+	}
 
 	var accessKey, secretKey string
 	var err error
@@ -1134,12 +1171,19 @@ func (sys *IAMSys) NewServiceAccount(ctx context.Context, parentUser string, gro
 	cred.ParentUser = parentUser
 	cred.Groups = groups
 	cred.Status = string(auth.AccountOn)
+	switch opts.status {
+	case "", auth.AccountOn, string(madmin.AccountEnabled):
+	case auth.AccountOff, string(madmin.AccountDisabled):
+		cred.Status = auth.AccountOff
+	default:
+		return auth.Credentials{}, time.Time{}, errInvalidArgument
+	}
 	cred.Name = opts.name
 	cred.Description = opts.description
 
 	if opts.expiration != nil {
 		expirationInUTC := opts.expiration.UTC()
-		if err := validateSvcExpirationInUTC(expirationInUTC); err != nil {
+		if err := validateSvcExpirationInUTC(ctx, expirationInUTC); err != nil {
 			return auth.Credentials{}, time.Time{}, err
 		}
 		cred.Expiration = expirationInUTC
@@ -1370,7 +1414,7 @@ func (sys *IAMSys) DeleteServiceAccount(ctx context.Context, accessKey string, n
 	}
 
 	sa, ok := sys.store.GetUser(accessKey)
-	if !ok || !sa.Credentials.IsServiceAccount() {
+	if _, replicated := iamReplicationTime(ctx); (!ok || !sa.Credentials.IsServiceAccount()) && !replicated {
 		return nil
 	}
 
@@ -1474,8 +1518,8 @@ func (sys *IAMSys) purgeExpiredCredentialsForExternalSSO(ctx context.Context) {
 		}
 	}
 
-	// We ignore any errors
-	_ = sys.store.DeleteUsers(ctx, expiredUsers)
+	// Keep failed revocations visible so the next purge can retry.
+	iamLogIf(ctx, sys.store.DeleteUsers(ctx, expiredUsers))
 }
 
 // purgeExpiredCredentialsForLDAP - validates if local credentials are still
@@ -1503,8 +1547,8 @@ func (sys *IAMSys) purgeExpiredCredentialsForLDAP(ctx context.Context) {
 		return
 	}
 
-	// We ignore any errors
-	_ = sys.store.DeleteUsers(ctx, expiredUsers)
+	// Keep failed revocations visible so the next purge can retry.
+	iamLogIf(ctx, sys.store.DeleteUsers(ctx, expiredUsers))
 }
 
 // updateGroupMembershipsForLDAP - updates the list of groups associated with the credential.
@@ -1925,12 +1969,12 @@ func (sys *IAMSys) RemoveUsersFromGroup(ctx context.Context, group string, membe
 	}
 
 	updatedAt, err = sys.store.RemoveUsersFromGroup(ctx, group, members)
-	if err != nil {
+	var cleanupErr *iamCommittedCleanupError
+	if err != nil && !errors.As(err, &cleanupErr) {
 		return updatedAt, err
 	}
-
 	sys.notifyForGroup(ctx, group)
-	return updatedAt, nil
+	return updatedAt, err
 }
 
 // SetGroupStatus - enable/disabled a group

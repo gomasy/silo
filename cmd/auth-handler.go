@@ -632,18 +632,11 @@ func isReqAuthenticated(ctx context.Context, r *http.Request, region string, sty
 		return ErrInvalidDigest
 	}
 
-	// Extract either 'X-Amz-Content-Sha256' header or 'X-Amz-Content-Sha256' query parameter (if V4 presigned)
-	// Do not verify 'X-Amz-Content-Sha256' if skipSHA256.
+	// Honor the selected header/query checksum, including the header fallback
+	// for a presigned request. STS separately hashes its body for its signature.
 	var contentSHA256 []byte
-	if skipSHA256 := skipContentSha256Cksum(r); !skipSHA256 && isRequestPresignedSignatureV4(r) {
-		if sha256Sum, ok := r.Form[xhttp.AmzContentSha256]; ok && len(sha256Sum) > 0 {
-			contentSHA256, err = hex.DecodeString(sha256Sum[0])
-			if err != nil {
-				return ErrContentSHA256Mismatch
-			}
-		}
-	} else if _, ok := r.Header[xhttp.AmzContentSha256]; !skipSHA256 && ok {
-		contentSHA256, err = hex.DecodeString(r.Header.Get(xhttp.AmzContentSha256))
+	if !skipContentSha256Cksum(r) {
+		contentSHA256, err = hex.DecodeString(getContentSha256Cksum(r, serviceS3))
 		if err != nil || len(contentSHA256) == 0 {
 			return ErrContentSHA256Mismatch
 		}

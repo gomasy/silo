@@ -425,7 +425,7 @@ func testListMultipartUploadsHandler(obj ObjectLayer, instanceType, bucketName s
 			shouldPass:         true,
 		},
 		// Test case - 4.
-		// Setting Invalid prefix and marker combination.
+		// A key marker outside the prefix is valid and produces an empty page.
 		{
 			bucket:             bucketName,
 			prefix:             "asia",
@@ -435,8 +435,8 @@ func testListMultipartUploadsHandler(obj ObjectLayer, instanceType, bucketName s
 			maxUploads:         "0",
 			accessKey:          credentials.AccessKey,
 			secretKey:          credentials.SecretKey,
-			expectedRespStatus: http.StatusNotImplemented,
-			shouldPass:         false,
+			expectedRespStatus: http.StatusOK,
+			shouldPass:         true,
 		},
 		// Test case - 5.
 		// Invalid upload id and marker combination.

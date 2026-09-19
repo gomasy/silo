@@ -38,7 +38,7 @@ pid=$!
 
 mc ready mysilo
 
-mc admin user add mysilo/ silo123 silo123
+mc admin user add mysilo/ silo123 silo12345
 
 mc admin policy create mysilo/ deny-non-sse-kms-pol ./docs/iam/policies/deny-non-sse-kms-objects.json
 mc admin policy create mysilo/ deny-invalid-sse-kms-pol ./docs/iam/policies/deny-objects-with-invalid-sse-kms-key-id.json
@@ -50,7 +50,7 @@ mc admin policy attach mysilo consoleAdmin --user silo123
 mc mb -l mysilo/test-bucket
 mc mb -l mysilo/multi-key-poc
 
-export MC_HOST_mysilo1="http://silo123:silo123@localhost:9000/"
+export MC_HOST_mysilo1="http://silo123:silo12345@localhost:9000/"
 
 mc cp /etc/issue mysilo1/test-bucket
 ret=$?
