@@ -10,13 +10,13 @@ Silo in distributed mode can help you setup a highly-available storage system wi
 
 Distributed Silo provides protection against multiple node/drive failures and [bit rot](https://github.com/pgsty/silo/blob/main/docs/erasure/README.md#what-is-bit-rot-protection) using [erasure code](https://silo.pgsty.com/operations/concepts/erasure-coding/). As the minimum drives required for distributed Silo is 2 (same as minimum drives required for erasure coding), erasure code automatically kicks in as you launch distributed Silo.
 
-If one or more drives are offline at the start of a PutObject or NewMultipartUpload operation the object will have additional data protection bits added automatically to provide additional safety for these objects.
+With the default `availability` storage-class optimization, Silo can increase parity for new objects when drives are offline, up to half the drives in the erasure set. Writes must still meet the quorum for the resulting shard layout. This does not guarantee unchanged availability or keep a two-drive `EC:1` set writable after one drive fails. See the [storage-class reference](https://silo.pgsty.com/reference/minio-server/settings/storage-class/) for details.
 
 ### High availability
 
-A stand-alone Silo server would go down if the server hosting the drives goes offline. In contrast, a distributed Silo setup with _m_ servers and _n_ drives will have your data safe as long as _m/2_ servers or _m*n_/2 or more drives are online.
+A stand-alone Silo server becomes unavailable if its host goes offline. In a distributed deployment, determine node-failure tolerance from how many drives each failed node removes from every erasure set and from the parity recorded for the affected objects. Aggregate online node or drive counts alone do not establish read or write quorum.
 
-For example, an 16-server distributed setup with 200 drives per node would continue serving files, up to 4 servers can be offline in default configuration i.e around 800 drives down Silo would continue to read and write objects.
+For example, if a 16-node pool has 16-drive erasure sets with one drive per node in each set, a fixed `EC:4` layout has a read and write quorum of 12. Losing four nodes leaves 12 drives in every set. This result depends on that drive placement and parity; it cannot be generalized to arbitrary failures of the same total number of drives. In a two-node, two-drive `EC:1` set, losing one node leaves only one drive, so existing intact objects can remain readable but writes cannot continue.
 
 Refer to sizing guide for more understanding on default values chosen depending on your erasure stripe size [here](https://github.com/pgsty/silo/blob/main/docs/distributed/SIZING.md). Parity settings can be changed using [storage classes](https://github.com/pgsty/silo/tree/main/docs/erasure/storage-class).
 

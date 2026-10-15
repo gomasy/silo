@@ -633,6 +633,8 @@ func TestPoolsConditionalPutReplicaAvailability(t *testing.T) {
 	}
 }
 
+// A public client cannot address a destination version, with or without a
+// precondition; only trusted replication may (SN-2026-016).
 func TestPoolsConditionalPutDestinationVersionHTTP(t *testing.T) {
 	z, _ := consistencyPools(t)
 	bucket, router := conditionalPutBucket(t, z, "versioned")
@@ -641,21 +643,14 @@ func TestPoolsConditionalPutDestinationVersionHTTP(t *testing.T) {
 	current := putConsistencyObject(t, z, bucket, object, 1, "current", ObjectOptions{Versioned: true, MTime: UTCNow().Add(-time.Minute)})
 	defer conditionalPutPool(t, z, object, 0)()
 	url := getPutObjectURL("", bucket, object) + "?versionId=" + old.VersionID
-	for _, stale := range []bool{true, false} {
-		tag, status := current.ETag, http.StatusOK
-		if stale {
-			tag, status = old.ETag, http.StatusPreconditionFailed
-		}
+	for _, tag := range []string{old.ETag, current.ETag} {
 		put := multipartConditionRequest(t, router, http.MethodPut, url, "replacement", map[string]string{xhttp.IfMatch: fmt.Sprintf("%q", tag)})
-		if put.Code != status {
-			t.Fatalf("version-addressed public PUT: %d want %d: %s", put.Code, status, put.Body.String())
-		}
-		if got := put.Header()[xhttp.AmzVersionID]; !stale && (len(got) != 1 || got[0] != old.VersionID) {
-			t.Fatalf("write version changed: %v", put.Header())
+		if put.Code != http.StatusForbidden {
+			t.Fatalf("version-addressed public PUT: %d want 403: %s", put.Code, put.Body.String())
 		}
 	}
 	get := multipartConditionRequest(t, router, http.MethodGet, url, "", nil)
-	if get.Code != http.StatusOK || get.Body.String() != "replacement" {
+	if get.Code != http.StatusOK || get.Body.String() != "old" {
 		t.Fatalf("addressed GET: %d %q", get.Code, get.Body.String())
 	}
 }

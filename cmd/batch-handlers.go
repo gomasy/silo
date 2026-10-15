@@ -583,7 +583,11 @@ func toObjectInfo(bucket, object string, objInfo minio.ObjectInfo) ObjectInfo {
 func (r BatchJobReplicateV1) writeAsArchive(ctx context.Context, objAPI ObjectLayer, remoteClnt *minio.Client, entries []ObjectInfo, prefix string) error {
 	input := make(chan minio.SnowballObject, 1)
 	opts := minio.SnowballOptions{
-		Opts:     minio.PutObjectOptions{},
+		Opts: minio.PutObjectOptions{
+			Internal: minio.AdvancedPutOptions{
+				ReplicationRequest: true,
+			},
+		},
 		InMemory: *r.Source.Snowball.InMemory,
 		Compress: *r.Source.Snowball.Compress,
 		SkipErrs: *r.Source.Snowball.SkipErrs,

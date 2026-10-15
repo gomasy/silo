@@ -1203,6 +1203,10 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 
 	if opts.ReplicaLockReconcile || opts.DataMovement {
 		opts.ReplicaLockReconcile = true
+	}
+	// Public overwrites need all pools for Object Lock. Unaddressed replica
+	// callbacks retain their set-local reads unless reconciliation is needed.
+	if opts.ReplicaLockReconcile || !opts.ReplicationRequest {
 		opts.replicaObjectInfo = z.replicaObjectInfo
 	}
 	oi, err := z.serverPools[idx].PutObject(ctx, bucket, object, data, opts)
@@ -1514,9 +1518,9 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		return objInfo, err
 	}
 
-	if !z.SinglePool() && dstOpts.ReplicaLockReconcile {
+	if !z.SinglePool() && (dstOpts.ReplicaLockReconcile || !dstOpts.ReplicationRequest) {
 		dstOpts.replicaObjectInfo = z.replicaObjectInfo
-		if !dstOpts.DataMovement {
+		if dstOpts.ReplicaLockReconcile && !dstOpts.DataMovement {
 			defer func() {
 				if err == nil {
 					err = z.retireReplicaCopies(ctx, dstBucket, dstObject, poolIdx, objInfo)
@@ -1553,13 +1557,16 @@ func (z *erasureServerPools) CopyObject(ctx context.Context, srcBucket, srcObjec
 		ServerSideEncryption:       dstOpts.ServerSideEncryption,
 		UserDefined:                srcInfo.UserDefined,
 		Versioned:                  dstOpts.Versioned,
+		VersionSuspended:           dstOpts.VersionSuspended,
 		VersionID:                  dstOpts.VersionID,
 		MTime:                      dstOpts.MTime,
 		NoLock:                     true,
 		EncryptFn:                  dstOpts.EncryptFn,
 		WantChecksum:               dstOpts.WantChecksum,
 		WantServerSideChecksumType: dstOpts.WantServerSideChecksumType,
+		ReplicationRequest:         dstOpts.ReplicationRequest,
 		ReplicaLockReconcile:       dstOpts.ReplicaLockReconcile,
+		DataMovement:               dstOpts.DataMovement,
 		replicaObjectInfo:          dstOpts.replicaObjectInfo,
 	}
 
@@ -2309,6 +2316,8 @@ func (z *erasureServerPools) CompleteMultipartUpload(ctx context.Context, bucket
 
 	if opts.ReplicaLockReconcile || opts.DataMovement {
 		opts.ReplicaLockReconcile = true
+	}
+	if opts.ReplicaLockReconcile || !opts.ReplicationRequest {
 		opts.replicaObjectInfo = z.replicaObjectInfo
 	}
 

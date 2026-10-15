@@ -1696,6 +1696,32 @@ func (er erasureObjects) CompleteMultipartUpload(ctx context.Context, bucket str
 		defer lk.Unlock(lkctx)
 	}
 
+	if !opts.ReplicationRequest && !opts.ReplicaLockReconcile && !opts.DataMovement {
+		getObjectInfo := er.getObjectInfo
+		if opts.replicaObjectInfo != nil {
+			getObjectInfo = opts.replicaObjectInfo
+		}
+		if fi.VersionID == "" || fi.VersionID == nullVersionID {
+			if err := checkObjectLockedForOverwrite(ctx, bucket, object, getObjectInfo); err != nil {
+				return oi, toObjectErr(err, bucket, object)
+			}
+		} else {
+			_, gerr := getObjectInfo(ctx, bucket, object, ObjectOptions{
+				VersionID:        fi.VersionID,
+				Versioned:        opts.Versioned,
+				VersionSuspended: opts.VersionSuspended,
+				NoLock:           true,
+			})
+			switch {
+			case gerr == nil, errors.As(gerr, &MethodNotAllowed{}):
+				return oi, toObjectErr(errAuthentication, bucket, object)
+			case isErrVersionNotFound(gerr) || isErrObjectNotFound(gerr):
+			default:
+				return oi, toObjectErr(gerr, bucket, object)
+			}
+		}
+	}
+
 	er.cleanupMultipartPath(ctx, paths...) // cleanup all part.N.meta, and skipped part.N's before final rename().
 
 	defer func() {

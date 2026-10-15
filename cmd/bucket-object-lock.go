@@ -20,8 +20,8 @@ package cmd
 import (
 	"context"
 	"errors"
-	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -164,76 +164,129 @@ func enforceRetentionBypassForDelete(ctx context.Context, r *http.Request, bucke
 	return nil
 }
 
-// enforceRetentionBypassForPut enforces whether an existing object under governance can be overwritten
-// with governance bypass headers set in the request.
-// Objects under site wide WORM cannot be overwritten.
-// For objects in "Governance" mode, overwrite is allowed if a) object retention date is past OR
-// governance bypass headers are set and user has governance bypass permissions.
-// Objects in compliance mode can be overwritten only if retention date is being extended. No mode change is permitted.
+// isRetentionActionAllowed evaluates action for a PutObjectRetention request
+// with the object-lock condition keys derived from the requested retention.
+// The keys come from the request, not from the stored version, so the
+// handler can decide s3:PutObjectRetention before reading any object state.
+func isRetentionActionAllowed(action policy.Action, bucket, object string, objRetention *objectlock.ObjectRetention, r *http.Request, cred auth.Credentials, owner bool) bool {
+	if cred.AccessKey == "" {
+		return false
+	}
+	t, err := objectlock.UTCNowNTP()
+	if err != nil {
+		return false
+	}
+	conditions := getConditionValues(r, "", cred)
+	conditions["object-lock-mode"] = []string{string(objRetention.Mode)}
+	conditions["object-lock-retain-until-date"] = []string{objRetention.RetainUntilDate.UTC().Format(time.RFC3339)}
+	// Relative days from now, for "object-lock-remaining-retention-days".
+	// Clearing retention (<Retention/>) has a zero RetainUntilDate, which must
+	// evaluate as 0 remaining days rather than a large positive math.Abs delta
+	// from year 0001.
+	days := 0
+	if !objRetention.RetainUntilDate.IsZero() && objRetention.RetainUntilDate.After(t) {
+		// Time.Sub saturates after about 292 years. Count seconds instead so
+		// maximum-retention policies also apply to distant RFC3339 dates.
+		seconds := objRetention.RetainUntilDate.Unix() - t.Unix()
+		days = int(seconds / 86400)
+		if seconds%86400 != 0 || objRetention.RetainUntilDate.Nanosecond() > t.Nanosecond() {
+			days++
+		}
+	}
+	conditions["object-lock-remaining-retention-days"] = []string{strconv.Itoa(days)}
+	return globalIAMSys.IsAllowed(policy.Args{
+		AccountName:     cred.AccessKey,
+		Groups:          cred.Groups,
+		Action:          action,
+		BucketName:      bucket,
+		ConditionValues: conditions,
+		ObjectName:      object,
+		IsOwner:         owner,
+		Claims:          cred.Claims,
+	})
+}
+
+// enforceRetentionBypassForPut enforces the stored retention of oi against a
+// PutObjectRetention request. The caller must already hold
+// s3:PutObjectRetention; this only decides changes that depend on the stored
+// state. Expired or absent retention may be changed freely. Unexpired
+// GOVERNANCE retention may be shortened, removed or have its mode changed only
+// with the bypass header and s3:BypassGovernanceRetention. Unexpired
+// COMPLIANCE retention may only be extended.
 func enforceRetentionBypassForPut(ctx context.Context, r *http.Request, oi ObjectInfo, objRetention *objectlock.ObjectRetention, cred auth.Credentials, owner bool) error {
-	byPassSet := objectlock.IsObjectLockGovernanceBypassSet(r.Header)
+	ret := objectlock.GetObjectRetentionMeta(oi.UserDefined)
+	if !ret.Mode.Valid() {
+		return nil
+	}
 
 	t, err := objectlock.UTCNowNTP()
 	if err != nil {
 		internalLogIf(ctx, err, logger.WarningKind)
 		return ObjectLocked{Bucket: oi.Bucket, Object: oi.Name, VersionID: oi.VersionID}
 	}
+	if ret.RetainUntilDate.Before(t) {
+		return nil
+	}
 
-	// Pass in relative days from current time, to additionally
-	// to verify "object-lock-remaining-retention-days" policy if any.
-	days := int(math.Ceil(math.Abs(objRetention.RetainUntilDate.Sub(t).Hours()) / 24))
-
-	ret := objectlock.GetObjectRetentionMeta(oi.UserDefined)
-	if ret.Mode.Valid() {
-		// Retention has expired you may change whatever you like.
-		if ret.RetainUntilDate.Before(t) {
-			apiErr := isPutRetentionAllowed(oi.Bucket, oi.Name,
-				days, objRetention.RetainUntilDate.Time,
-				objRetention.Mode, byPassSet, r, cred,
-				owner)
-			if apiErr == ErrAccessDenied {
-				return errAuthentication
-			}
-			return nil
+	weakens := objRetention.Mode != ret.Mode || objRetention.RetainUntilDate.Before(ret.RetainUntilDate.Time)
+	if !weakens {
+		return nil
+	}
+	switch ret.Mode {
+	case objectlock.RetGovernance:
+		// https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html#object-lock-bypass-governance
+		if !objectlock.IsObjectLockGovernanceBypassSet(r.Header) {
+			return ObjectLocked{Bucket: oi.Bucket, Object: oi.Name, VersionID: oi.VersionID}
 		}
-
-		switch ret.Mode {
-		case objectlock.RetGovernance:
-			govPerm := isPutRetentionAllowed(oi.Bucket, oi.Name, days,
-				objRetention.RetainUntilDate.Time, objRetention.Mode,
-				byPassSet, r, cred, owner)
-			// Governance mode retention period cannot be shortened, if x-amz-bypass-governance is not set.
-			if !byPassSet {
-				if objRetention.Mode != objectlock.RetGovernance || objRetention.RetainUntilDate.Before(ret.RetainUntilDate.Time) {
-					return ObjectLocked{Bucket: oi.Bucket, Object: oi.Name, VersionID: oi.VersionID}
-				}
-			}
-			if govPerm == ErrAccessDenied {
-				return errAuthentication
-			}
-			return nil
-		case objectlock.RetCompliance:
-			// Compliance retention mode cannot be changed or shortened.
-			// https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lock-overview.html#object-lock-retention-modes
-			if objRetention.Mode != objectlock.RetCompliance || objRetention.RetainUntilDate.Before(ret.RetainUntilDate.Time) {
-				return ObjectLocked{Bucket: oi.Bucket, Object: oi.Name, VersionID: oi.VersionID}
-			}
-			apiErr := isPutRetentionAllowed(oi.Bucket, oi.Name,
-				days, objRetention.RetainUntilDate.Time, objRetention.Mode,
-				false, r, cred, owner)
-			if apiErr == ErrAccessDenied {
-				return errAuthentication
-			}
-			return nil
+		if !isRetentionActionAllowed(policy.BypassGovernanceRetentionAction, oi.Bucket, oi.Name, objRetention, r, cred, owner) {
+			return errAuthentication
 		}
 		return nil
-	} // No pre-existing retention metadata present.
+	default:
+		// Compliance retention mode cannot be changed or shortened.
+		// https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lock-overview.html#object-lock-retention-modes
+		return ObjectLocked{Bucket: oi.Bucket, Object: oi.Name, VersionID: oi.VersionID}
+	}
+}
 
-	apiErr := isPutRetentionAllowed(oi.Bucket, oi.Name,
-		days, objRetention.RetainUntilDate.Time,
-		objRetention.Mode, byPassSet, r, cred, owner)
-	if apiErr == ErrAccessDenied {
-		return errAuthentication
+// checkObjectLockedForOverwrite re-checks under the object write lock whether an
+// in-place write to the null version (such as a directory object) would
+// overwrite a locked version in an Object Lock bucket.
+func checkObjectLockedForOverwrite(ctx context.Context, bucket, object string, getObjectInfoFn GetObjectInfoFn) error {
+	if isMinioMetaBucketName(bucket) {
+		return nil
+	}
+	retentionCfg, err := globalBucketObjectLockSys.Get(bucket)
+	if err != nil {
+		return err
+	}
+	if !retentionCfg.LockEnabled {
+		return nil
+	}
+	objInfo, err := getObjectInfoFn(ctx, bucket, object, ObjectOptions{
+		VersionID:  nullVersionID,
+		NoLock:     true,
+		NoAuditLog: true,
+	})
+	if err != nil {
+		if isErrObjectNotFound(err) || isErrVersionNotFound(err) || errors.As(err, &MethodNotAllowed{}) {
+			return nil
+		}
+		return err
+	}
+	if objectlock.GetObjectLegalHoldMeta(objInfo.UserDefined).Status == objectlock.LegalHoldOn {
+		return ObjectLocked{Bucket: bucket, Object: decodeDirObject(object), VersionID: nullVersionID}
+	}
+	r := objectlock.GetObjectRetentionMeta(objInfo.UserDefined)
+	if r.Mode == objectlock.RetCompliance || r.Mode == objectlock.RetGovernance {
+		t, err := objectlock.UTCNowNTP()
+		if err != nil {
+			internalLogIf(ctx, err, logger.WarningKind)
+			return ObjectLocked{Bucket: bucket, Object: decodeDirObject(object), VersionID: nullVersionID}
+		}
+		if r.RetainUntilDate.After(t) {
+			return ObjectLocked{Bucket: bucket, Object: decodeDirObject(object), VersionID: nullVersionID}
+		}
 	}
 	return nil
 }
@@ -274,16 +327,24 @@ func checkPutObjectLockAllowed(ctx context.Context, rq *http.Request, bucket, ob
 	if err != nil {
 		return mode, retainDate, legalHold, toAPIErrorCode(ctx, err)
 	}
+	if isDirObject(object) && opts.VersionID == "" {
+		opts.VersionID = nullVersionID
+	}
 
 	if opts.VersionID != "" && !replicaTrusted {
-		if objInfo, err := getObjectInfoFn(ctx, bucket, object, opts); err == nil {
+		objInfo, err := getObjectInfoFn(ctx, bucket, object, opts)
+		if err != nil {
+			if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) && !errors.As(err, &MethodNotAllowed{}) {
+				return mode, retainDate, legalHold, toAPIErrorCode(ctx, err)
+			}
+		} else {
 			r := objectlock.GetObjectRetentionMeta(objInfo.UserDefined)
 			t, err := objectlock.UTCNowNTP()
 			if err != nil {
 				internalLogIf(ctx, err, logger.WarningKind)
 				return mode, retainDate, legalHold, ErrObjectLocked
 			}
-			if r.Mode == objectlock.RetCompliance && r.RetainUntilDate.After(t) {
+			if (r.Mode == objectlock.RetCompliance || r.Mode == objectlock.RetGovernance) && r.RetainUntilDate.After(t) {
 				return mode, retainDate, legalHold, ErrObjectLocked
 			}
 			mode = r.Mode

@@ -38,31 +38,23 @@ You can calculate _approximate_ storage usage ratio using the formula - total dr
 
 ### Allowed values for STANDARD storage class
 
-`STANDARD` storage class implies more parity than `REDUCED_REDUNDANCY` class. So, `STANDARD` parity drives should be
+`STANDARD` supports `EC:0` without erasure-code redundancy and nonzero parity values up to `floor(N/2)`, where `N` is the number of drives in the erasure set. When both `STANDARD` and `REDUCED_REDUNDANCY` parity are nonzero, `STANDARD` must be greater than or equal to `REDUCED_REDUNDANCY`; equal parity is allowed.
 
-- Greater than or equal to 2, if `REDUCED_REDUNDANCY` parity is not set.
-- Greater than `REDUCED_REDUNDANCY` parity, if it is set.
+The default `STANDARD` parity is:
 
-Parity blocks can not be higher than data blocks, so `STANDARD` storage class parity can not be higher than N/2. (N being total number of drives)
-
-The default value for the `STANDARD` storage class depends on the number of volumes in the erasure set:
-
-| Erasure Set Size | Default Parity (EC:N) |
-|------------------|-----------------------|
-| 5 or fewer       |                 EC:2  |
-| 6-7              |                 EC:3  |
-| 8 or more        |                 EC:4  |
+| Erasure Set Size | Default Parity (EC:M) |
+| --- | --- |
+| 1 | EC:0 |
+| 2–3 | EC:1 |
+| 4–5 | EC:2 |
+| 6–7 | EC:3 |
+| 8–16 | EC:4 |
 
 For more complete documentation on Erasure Set sizing, see the [Silo Documentation on Erasure Sets](https://silo.pgsty.com/operations/concepts/erasure-coding/#minio-ec-erasure-set).
 
 ### Allowed values for REDUCED_REDUNDANCY storage class
 
-`REDUCED_REDUNDANCY` implies lesser parity than `STANDARD` class. So,`REDUCED_REDUNDANCY` parity drives should be
-
-- Less than N/2, if `STANDARD` parity is not set.
-- Less than `STANDARD` Parity, if it is set.
-
-Default value for `REDUCED_REDUNDANCY` storage class is `1`.
+`REDUCED_REDUNDANCY` parity can be zero or up to `floor(N/2)`. When both storage classes have nonzero parity, its parity must be less than or equal to `STANDARD` parity. The default is `EC:1` for multi-drive sets and `EC:0` for single-drive deployments. See the [Silo storage-class reference](https://silo.pgsty.com/reference/minio-server/settings/storage-class/) for the maintained configuration documentation.
 
 ## Get started with Storage Class
 

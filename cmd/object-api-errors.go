@@ -668,7 +668,7 @@ var (
 func completeMultipartChecksumMismatch(algorithm string) error {
 	description := "The checksum you specified did not match the calculated checksum."
 	if algorithm != "" {
-		description = fmt.Sprintf("The %s checksum you specified did not match the calculated checksum.", algorithm)
+		description = fmt.Sprintf("The %s you specified did not match the calculated checksum.", algorithm)
 	}
 	return fmt.Errorf("%w: %s", errCompleteMultipartChecksumMismatch, description)
 }

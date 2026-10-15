@@ -238,7 +238,7 @@ func r5APIOrdering(t *testing.T, encrypted bool) {
 						if err != nil {
 							t.Fatal(err)
 						}
-						original, err = obj.CompleteMultipartUpload(t.Context(), bucket, name, mp.UploadID, []CompletePart{{PartNumber: 1, ETag: part.ETag}}, ObjectOptions{Versioned: true})
+						original, err = obj.CompleteMultipartUpload(t.Context(), bucket, name, mp.UploadID, []CompletePart{{PartNumber: 1, ETag: part.ETag}}, ObjectOptions{Versioned: true, ReplicationRequest: true})
 						if err != nil {
 							t.Fatal(err)
 						}

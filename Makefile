@@ -4,7 +4,7 @@ LDFLAGS := $(shell go run buildscripts/gen-ldflags.go)
 
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
-GOLANGCI_VERSION ?= v2.13.1
+GOLANGCI_VERSION ?= v2.14.0
 
 VERSION ?= $(shell git describe --tags)
 REPO ?= docker.io/pgsty

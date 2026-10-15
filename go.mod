@@ -1,6 +1,6 @@
 module github.com/minio/minio
 
-go 1.27.1
+go 1.27.2
 
 // Console and MC retain their historical module paths for best-effort upstream
 // compatibility. Pin the maintained PGSTY implementations used by SILO.
@@ -294,7 +294,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.45.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/mod v0.41.0 // indirect
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/tools v0.50.0 // indirect
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect

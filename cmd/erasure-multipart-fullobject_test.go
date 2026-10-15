@@ -253,7 +253,7 @@ func testAPICompleteMultipartFullObjectChecksumMismatch(obj ObjectLayer, instanc
 	if apiErr.Code != "BadDigest" {
 		t.Fatalf("%s: expected BadDigest, got %q", instanceType, apiErr.Code)
 	}
-	if want := "The CRC32 checksum you specified did not match the calculated checksum."; apiErr.Message != want {
+	if want := "The CRC32 you specified did not match the calculated checksum."; apiErr.Message != want {
 		t.Fatalf("%s: expected message %q, got %q", instanceType, want, apiErr.Message)
 	}
 
@@ -361,7 +361,7 @@ func testAPICompleteMultipartCompositeChecksumMismatch(obj ObjectLayer, instance
 	if apiErr.Code != "BadDigest" {
 		t.Fatalf("%s: expected BadDigest, got %q", instanceType, apiErr.Code)
 	}
-	if want := "The CRC32 checksum you specified did not match the calculated checksum."; apiErr.Message != want {
+	if want := "The CRC32 you specified did not match the calculated checksum."; apiErr.Message != want {
 		t.Fatalf("%s: expected message %q, got %q", instanceType, want, apiErr.Message)
 	}
 	if _, err := obj.GetObjectInfo(t.Context(), bucketName, objectName, ObjectOptions{}); err == nil {

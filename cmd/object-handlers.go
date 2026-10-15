@@ -3435,24 +3435,13 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	// Check permissions to perform this object retention operation
 	if s3Error := authenticateRequest(ctx, r, policy.PutObjectRetentionAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
-	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
-
 	if !validateLengthAndChecksum(r) {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingContentMD5), r.URL)
-		return
-	}
-
-	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); !rcfg.LockEnabled {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidBucketObjectLockConfiguration), r.URL)
 		return
 	}
 
@@ -3466,6 +3455,24 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 
 	reqInfo := logger.GetReqInfo(ctx)
 	reqInfo.SetTags("retention", objRetention.String())
+
+	// Check permissions to perform this object retention operation. The
+	// object-lock condition keys come from the request body, so this is
+	// decided before any bucket or object state is read.
+	if !isRetentionActionAllowed(policy.PutObjectRetentionAction, bucket, object, objRetention, r, reqInfo.Cred, reqInfo.Owner) {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		return
+	}
+
+	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); !rcfg.LockEnabled {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidBucketObjectLockConfiguration), r.URL)
+		return
+	}
 
 	opts, err := getOpts(ctx, r, bucket, object)
 	if err != nil {

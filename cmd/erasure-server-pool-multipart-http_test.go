@@ -265,6 +265,7 @@ func TestPoolsMultipartConditionalLatestVersionAndCallbackOnce(t *testing.T) {
 			if explicit {
 				current = putConsistencyObject(t, z, bucket, object, 1, "latest-other-version", ObjectOptions{Versioned: true, MTime: UTCNow().Add(-time.Minute)})
 			}
+			opts.VersionID = ""
 			id, parts := multipartConditionUpload(t, z, bucket, object, 1, opts)
 			called := 0
 			opts.CheckPrecondFn = func(oi ObjectInfo) bool { called++; return oi.ETag != current.ETag }

@@ -550,7 +550,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrBadDigest: {
 		Code:           "BadDigest",
-		Description:    "The Content-Md5 you specified did not match what we received.",
+		Description:    "The Content-MD5 you specified did not match what we received.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrEntityTooSmall: {

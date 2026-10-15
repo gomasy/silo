@@ -290,6 +290,9 @@ func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScan
 		for update := range updates {
 			resp := storageNSScannerRPC.NewResponse()
 			resp.Update = &update
+			// Pooled responses may carry fields from a previous
+			// scan, always clear the fields not being set.
+			resp.Final = nil
 			out <- resp
 		}
 	}()
@@ -301,6 +304,7 @@ func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScan
 	// Send final response.
 	resp := storageNSScannerRPC.NewResponse()
 	resp.Final = &ui
+	resp.Update = nil
 	out <- resp
 	return nil
 }

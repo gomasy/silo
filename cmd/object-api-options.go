@@ -347,6 +347,11 @@ func putOpts(ctx context.Context, bucket, object, vid string, hdrs http.Header, 
 	versionSuspended := globalBucketVersioningSys.PrefixSuspended(bucket, object)
 
 	vid = strings.TrimSpace(vid)
+	// A caller-chosen version ID writes that version in place. Only trusted
+	// replication may recreate a source version under its original ID.
+	if vid != "" && !trustedReplication {
+		return opts, errAuthentication
+	}
 	if vid != "" && vid != nullVersionID {
 		_, err := uuid.Parse(vid)
 		if err != nil {

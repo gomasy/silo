@@ -1273,6 +1273,12 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
 		return
 	}
+	if isDirObject(object) {
+		if _, _, _, s3Err := checkPutObjectLockAllowed(ctx, r, bucket, object, objectAPI.GetObjectInfo, ErrNone, ErrNone, false); s3Err != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+			return
+		}
+	}
 	opts.WantChecksum = checksum
 
 	fanOutOpts := fanOutOptions{Checksum: checksum}

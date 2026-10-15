@@ -28,13 +28,10 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"github.com/minio/minio/internal/auth"
-	objectlock "github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/etag"
 	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
@@ -731,48 +728,6 @@ func setAuthMiddleware(h http.Handler) http.Handler {
 		writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrSignatureVersionNotSupported), r.URL)
 		atomic.AddUint64(&globalHTTPStats.rejectedRequestsAuth, 1)
 	})
-}
-
-func isPutRetentionAllowed(bucketName, objectName string, retDays int, retDate time.Time, retMode objectlock.RetMode, byPassSet bool, r *http.Request, cred auth.Credentials, owner bool) (s3Err APIErrorCode) {
-	var retSet bool
-	if cred.AccessKey == "" {
-		return ErrAccessDenied
-	}
-
-	conditions := getConditionValues(r, "", cred)
-	conditions["object-lock-mode"] = []string{string(retMode)}
-	conditions["object-lock-retain-until-date"] = []string{retDate.UTC().Format(time.RFC3339)}
-	if retDays > 0 {
-		conditions["object-lock-remaining-retention-days"] = []string{strconv.Itoa(retDays)}
-	}
-	if retMode == objectlock.RetGovernance && byPassSet {
-		byPassSet = globalIAMSys.IsAllowed(policy.Args{
-			AccountName:     cred.AccessKey,
-			Groups:          cred.Groups,
-			Action:          policy.BypassGovernanceRetentionAction,
-			BucketName:      bucketName,
-			ObjectName:      objectName,
-			ConditionValues: conditions,
-			IsOwner:         owner,
-			Claims:          cred.Claims,
-		})
-	}
-	if globalIAMSys.IsAllowed(policy.Args{
-		AccountName:     cred.AccessKey,
-		Groups:          cred.Groups,
-		Action:          policy.PutObjectRetentionAction,
-		BucketName:      bucketName,
-		ConditionValues: conditions,
-		ObjectName:      objectName,
-		IsOwner:         owner,
-		Claims:          cred.Claims,
-	}) {
-		retSet = true
-	}
-	if byPassSet || retSet {
-		return ErrNone
-	}
-	return ErrAccessDenied
 }
 
 // isPutActionAllowed - check if PUT operation is allowed on the resource, this

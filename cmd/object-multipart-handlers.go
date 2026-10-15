@@ -1166,7 +1166,7 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 		return
 	}
 
-	if _, _, _, s3Err := checkPutObjectLockAllowed(ctx, r, bucket, object, objectAPI.GetObjectInfo, ErrNone, ErrNone, false); s3Err != ErrNone {
+	if _, _, _, s3Err := checkPutObjectLockAllowed(ctx, r, bucket, object, objectAPI.GetObjectInfo, ErrNone, ErrNone, trustedReplication); s3Err != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 		return
 	}
