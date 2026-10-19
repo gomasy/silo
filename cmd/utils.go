@@ -636,6 +636,10 @@ func NewHTTPTransportWithClientCerts(clientCert, clientKey string) http.RoundTri
 		if err != nil {
 			internalLogIf(ctx, fmt.Errorf("Unable to load client key and cert, please check your client certificate configuration: %w", err))
 		}
+		if transport == nil {
+			// Client certs are not readable return default transport.
+			return s.NewHTTPTransportWithTimeout(1 * time.Minute)
+		}
 		return transport
 	}
 

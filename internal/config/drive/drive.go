@@ -40,17 +40,18 @@ var DefaultKVS = config.KVS{
 	},
 }
 
+var configLk sync.RWMutex
+
 // Config represents the subnet related configuration
 type Config struct {
 	// MaxTimeout - maximum timeout for a drive operation
 	MaxTimeout time.Duration `json:"maxTimeout"`
-	mutex      sync.RWMutex
 }
 
 // Update - updates the config with latest values
-func (c *Config) Update(updated *Config) error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
+func (c *Config) Update(updated Config) error {
+	configLk.Lock()
+	defer configLk.Unlock()
 	c.MaxTimeout = getMaxTimeout(updated.MaxTimeout)
 	return nil
 }
@@ -62,22 +63,23 @@ func (c *Config) GetMaxTimeout() time.Duration {
 
 // GetOPTimeout - returns the per call drive operation timeout
 func (c *Config) GetOPTimeout() time.Duration {
-	c.mutex.RLock()
-	defer c.mutex.RUnlock()
+	configLk.RLock()
+	defer configLk.RUnlock()
+
 	return getMaxTimeout(c.MaxTimeout)
 }
 
 // LookupConfig - lookup config and override with valid environment settings if any.
-func LookupConfig(kvs config.KVS) (cfg *Config, err error) {
+func LookupConfig(kvs config.KVS) (cfg Config, err error) {
+	cfg = Config{
+		MaxTimeout: 30 * time.Second,
+	}
 	if err = config.CheckValidKeys(config.DriveSubSys, kvs, DefaultKVS); err != nil {
 		return cfg, err
 	}
 
 	// if not set. Get default value from environment
 	d := env.Get(EnvMaxDriveTimeout, env.Get(EnvMaxDriveTimeoutLegacy, env.Get(EnvMaxDiskTimeoutLegacy, kvs.GetWithDefault(MaxTimeout, DefaultKVS))))
-	cfg = &Config{
-		mutex: sync.RWMutex{},
-	}
 	if d == "" {
 		cfg.MaxTimeout = 30 * time.Second
 	} else {

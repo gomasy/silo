@@ -42,8 +42,31 @@ type Config struct {
 	ExpirationWorkers int
 }
 
+// Accept stored access-tier settings without re-enabling the retired feature.
+var deprecatedKeys = []string{
+	"access_tiering",
+	"access_pools",
+	"access_max_size",
+	"access_promote_watermark",
+	"access_bin_width",
+	"access_bins",
+	"access_flush",
+	"access_min_residency",
+	"access_workers",
+	"access_max_tracked",
+}
+
 // LookupConfig - lookup ilm config and override with valid environment settings if any.
 func LookupConfig(kvs config.KVS) (cfg Config, err error) {
+	cfg = Config{
+		TransitionWorkers: 100,
+		ExpirationWorkers: 100,
+	}
+
+	if err = config.CheckValidKeys(config.ILMSubSys, kvs, DefaultKVS, deprecatedKeys...); err != nil {
+		return cfg, err
+	}
+
 	tw, err := strconv.Atoi(env.Get(EnvILMTransitionWorkers, kvs.GetWithDefault(transitionWorkers, DefaultKVS)))
 	if err != nil {
 		return cfg, err
