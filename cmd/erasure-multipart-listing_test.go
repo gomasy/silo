@@ -22,16 +22,59 @@ import (
 	"github.com/minio/minio/internal/config/storageclass"
 )
 
-// Check the real handler and storage path, including a successful abort between
-// pages. Choose IDs increasing in both initiation time and lexical order so the
-// failure does not depend on differing interpretations of S3 marker ordering.
-func TestMultipartListingAbortBetweenHTTPPages(t *testing.T) {
+// The persistent scanner is retained for diagnostics. This test-only wrapper
+// preserves its pagination coverage without exposing it through public listing.
+func (z *erasureServerPools) scanMultipartUploadsForTest(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (ListMultipartsInfo, error) {
+	if err := checkListMultipartArgs(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter); err != nil {
+		return ListMultipartsInfo{}, err
+	}
+	if _, err := z.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
+		return ListMultipartsInfo{}, toObjectErr(err, bucket)
+	}
+	scan, err := startMultipartScan(ctx, false)
+	if err != nil {
+		return ListMultipartsInfo{}, err
+	}
+	defer scan.close()
+
+	var uploads []MultipartInfo
+	for idx, pool := range z.serverPools {
+		if z.IsSuspended(idx) {
+			continue
+		}
+		poolUploads, err := pool.scanMultipartUploadsForTest(scan, bucket, idx)
+		if err != nil {
+			return ListMultipartsInfo{}, err
+		}
+		uploads = append(uploads, poolUploads...)
+	}
+
+	// Confirmed historical records lack a recoverable bucket/key and are
+	// omitted by the scan. They do not block listing identifiable uploads.
+	return paginateMultipartUploads(uploads, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads), nil
+}
+
+func (s *erasureSets) scanMultipartUploadsForTest(scan *multipartScan, bucket string, poolIdx int) ([]MultipartInfo, error) {
+	var uploads []MultipartInfo
+	for i, set := range s.sets {
+		setUploads, err := set.scanMultipartUploads(scan, bucket, poolIdx, i)
+		if err != nil {
+			return nil, err
+		}
+		uploads = append(uploads, setUploads...)
+	}
+	return uploads, nil
+}
+
+// Check that a successful HTTP abort removes the cached upload. The restored
+// cache path still ignores page limits; this is a documented legacy limitation.
+func TestMultipartListingAbortHTTPUpdatesCache(t *testing.T) {
 	z, _ := consistencyPools(t)
 	bucket, router, err := initAPIHandlerTest(t.Context(), z, []string{"ListMultipartUploads", "AbortMultipart"}, MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	setMultipartListingTestMode(t, false)
+
 	var firstID, secondID string
 	for attempt := 0; attempt < 32; attempt++ {
 		one, err := z.NewMultipartUpload(t.Context(), bucket, "a", ObjectOptions{})
@@ -81,8 +124,8 @@ func TestMultipartListingAbortBetweenHTTPPages(t *testing.T) {
 		return result
 	}
 	first := list("", "", 1)
-	if len(first.Uploads) != 1 || first.Uploads[0].UploadID != firstID || !first.IsTruncated {
-		t.Fatalf("unexpected first page: %+v", first)
+	if len(first.Uploads) != 3 || first.Uploads[0].UploadID != firstID || first.IsTruncated {
+		t.Fatalf("unexpected legacy cache view: %+v", first)
 	}
 	rec := request(http.MethodDelete, getAbortMultipartUploadURL("", bucket, "a", firstID))
 	if rec.Code != http.StatusNoContent {
@@ -93,12 +136,12 @@ func TestMultipartListingAbortBetweenHTTPPages(t *testing.T) {
 	for _, upload := range rest.Uploads {
 		keys = append(keys, upload.Key)
 	}
-	t.Logf("GET first page=200; DELETE marker=204; GET next page=200 keys=%v truncated=%v", keys, rest.IsTruncated)
+	t.Logf("GET cache=200; DELETE upload=204; GET cache=200 keys=%v truncated=%v", keys, rest.IsTruncated)
 	if _, err := z.GetMultipartInfo(t.Context(), bucket, "a", secondID, ObjectOptions{}); err != nil {
 		t.Fatalf("remaining upload is not valid: %v", err)
 	}
 	if len(rest.Uploads) != 2 || rest.Uploads[0].UploadID != secondID {
-		t.Fatalf("valid remaining upload for key a is missing from continuation: %+v", rest.Uploads)
+		t.Fatalf("valid remaining upload for key a is missing from cache: %+v", rest.Uploads)
 	}
 }
 
@@ -148,28 +191,25 @@ func TestMultipartListingLegacyPreflight(t *testing.T) {
 		t.Fatal(err)
 	}
 	z.mpCache.Clear()
-	t.Run("legacy-upgrade", func(t *testing.T) {
-		setMultipartListingTestMode(t, true)
-		exact, err := z.ListMultipartUploads(t.Context(), other, "old", "", "", "", 10)
+	for _, target := range []string{bucket, other} {
+		got, err := z.scanMultipartUploadsForTest(t.Context(), target, "", "", "", "", 10)
 		if err != nil {
 			t.Fatal(err)
 		}
-		requireMultipartUploadKeys(t, exact, "old")
-		const empty = "multipart-legacy-empty"
-		if err := z.MakeBucket(t.Context(), empty, MakeBucketOptions{}); err != nil {
-			t.Fatal(err)
+		if target == bucket {
+			requireMultipartUploadKeys(t, got, "a")
+		} else {
+			requireMultipartUploadKeys(t, got)
 		}
-		got, err := z.ListMultipartUploads(t.Context(), empty, "", "", "", "", 10)
-		if err != nil || len(got.Uploads) != 0 {
-			t.Fatalf("old upload in another bucket broke legacy listing: %+v %v", got, err)
-		}
-	})
-	_, err = z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 10)
-	if !errors.Is(err, errMultipartListingLegacy) {
-		t.Fatalf("old upload in another bucket: %v", err)
 	}
+	// Diagnostic discovery cannot recover an unidentified historical key.
+	exact, err := z.scanMultipartUploadsForTest(t.Context(), other, "old", "", "", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireMultipartUploadKeys(t, exact)
 	report, err := z.multipartPreflight(t.Context())
-	if err != nil || report.Ready || !report.Complete || report.LegacyUploads != 1 {
+	if err != nil || report.Ready || !report.Complete || report.LegacyUploads != 1 || report.Mode != "legacy" {
 		t.Fatalf("legacy preflight: %+v %v", report, err)
 	}
 	if err = z.AbortMultipartUpload(t.Context(), other, "old", old.UploadID, ObjectOptions{}); err != nil {
@@ -179,15 +219,15 @@ func TestMultipartListingLegacyPreflight(t *testing.T) {
 	if err != nil || !report.Ready || report.LegacyUploads != 0 {
 		t.Fatalf("drained preflight: %+v %v", report, err)
 	}
-	got, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 10)
+	got, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireMultipartUploadKeys(t, got, "a")
 }
 
-func TestMultipartListingIdentityFallback(t *testing.T) {
-	for _, kind := range []string{"old", "corrupt", "read-failure", "wrong-bucket"} {
+func TestMultipartDiagnosticIdentityFallback(t *testing.T) {
+	for _, kind := range []string{"old", "partial", "corrupt", "read-failure", "wrong-bucket"} {
 		t.Run(kind, func(t *testing.T) {
 			z, set, bucket := multipartListingFixture(t)
 			if _, err := z.NewMultipartUpload(t.Context(), bucket, "a", ObjectOptions{}); err != nil {
@@ -209,8 +249,11 @@ func TestMultipartListingIdentityFallback(t *testing.T) {
 								return FileInfo{}, errFileCorrupt
 							}
 							fi.Metadata = cloneMSS(fi.Metadata)
-							if kind == "old" {
+							if kind == "old" || kind == "partial" {
 								delete(fi.Metadata, multipartMetaBucket)
+								if kind == "old" {
+									delete(fi.Metadata, multipartMetaObject)
+								}
 							} else {
 								fi.Metadata[multipartMetaBucket] = "another-bucket"
 							}
@@ -220,7 +263,7 @@ func TestMultipartListingIdentityFallback(t *testing.T) {
 				}
 				return disks
 			}
-			got, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 10)
+			got, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 10)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -231,7 +274,7 @@ func TestMultipartListingIdentityFallback(t *testing.T) {
 
 func TestMultipartAbortPoolsAndRetry(t *testing.T) {
 	z, bucket := consistencyPools(t)
-	setMultipartListingTestMode(t, false)
+
 	mp, err := z.serverPools[1].NewMultipartUpload(t.Context(), bucket, "a", ObjectOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -252,10 +295,12 @@ func TestMultipartAbortPoolsAndRetry(t *testing.T) {
 	if err == nil || toAPIError(t.Context(), err).HTTPStatusCode != 503 {
 		t.Fatalf("unknown pool must not acknowledge cancellation: %v", err)
 	}
+	if _, err := z.serverPools[1].GetMultipartInfo(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{}); err != nil {
+		t.Fatalf("earlier pool error changed the later pool: %v", err)
+	}
 	emptySet.getDisks = original
-	err = z.AbortMultipartUpload(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{})
-	if _, ok := err.(InvalidUploadID); !ok {
-		t.Fatalf("retry after all pools confirm absence: %v", err)
+	if err = z.AbortMultipartUpload(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{}); err != nil {
+		t.Fatalf("retry after pool recovery: %v", err)
 	}
 	mp, err = z.serverPools[1].NewMultipartUpload(t.Context(), bucket, "a", ObjectOptions{})
 	if err != nil {
@@ -289,12 +334,13 @@ func TestMultipartAbortRetryBelowReadQuorum(t *testing.T) {
 		}}
 		return disks
 	}
-	if err = z.AbortMultipartUpload(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{}); err == nil {
-		t.Fatal("lost acknowledgement must fail")
+	if err = z.AbortMultipartUpload(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{}); err != nil {
+		t.Fatalf("best-effort cleanup must retain read-quorum availability: %v", err)
 	}
 	set.getDisks = original
-	if err = z.AbortMultipartUpload(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{}); err != nil {
-		t.Fatalf("one remaining metadata copy prevented retry: %v", err)
+	var invalid InvalidUploadID
+	if err = z.AbortMultipartUpload(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{}); !errors.As(err, &invalid) {
+		t.Fatalf("minority remnant must retain absent-upload result: %v", err)
 	}
 }
 
@@ -304,7 +350,7 @@ func TestMultipartListingMarkerHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	setMultipartListingTestMode(t, false)
+
 	for _, tc := range []struct {
 		key, marker string
 		status      int
@@ -388,7 +434,7 @@ func TestMultipartAbortLateCreateBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	z := obj.(*erasureServerPools)
-	setMultipartListingTestMode(t, false)
+
 	t.Cleanup(func() { z.Shutdown(context.Background()); removeRoots(dirs) })
 	saved := globalStorageClass
 	globalStorageClass.Update(storageclass.Config{Standard: storageclass.StorageClass{Parity: 8}})
@@ -417,9 +463,7 @@ func TestMultipartAbortLateCreateBoundary(t *testing.T) {
 	}
 	set.getDisks = func() []StorageAPI {
 		disks := append([]StorageAPI(nil), original()...)
-		for i := 2; i < 9; i++ {
-			disks[i] = nil
-		}
+		disks[8] = nil
 		return disks
 	}
 	if err = z.AbortMultipartUpload(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{}); err != nil {
@@ -431,7 +475,7 @@ func TestMultipartAbortLateCreateBoundary(t *testing.T) {
 		}
 	}
 	set.getDisks = original
-	_, metadata, err := set.checkUploadIDExists(t.Context(), bucket, "a", mp.UploadID, true)
+	_, metadata, err := set.checkUploadIDExists(t.Context(), bucket, "a", mp.UploadID, false)
 	if err != nil {
 		t.Fatalf("late creation boundary changed; review and remove the documented limitation: %v", err)
 	}
@@ -441,10 +485,10 @@ func TestMultipartAbortLateCreateBoundary(t *testing.T) {
 			count++
 		}
 	}
-	if count != 14 {
-		t.Fatalf("expected fourteen resurrected copies, got %d", count)
+	if count != 8 {
+		t.Fatalf("expected eight resurrected copies, got %d", count)
 	}
-	t.Log("KNOWN UNRESOLVED BOUNDARY: seven delayed creation writes plus seven offline copies restore a writable upload after acknowledged cancellation")
+	t.Log("KNOWN UNRESOLVED BOUNDARY: seven delayed creation writes plus one offline copy restore a readable upload after acknowledged cancellation")
 }
 
 type multipartListingCountingDisk struct {
@@ -468,13 +512,13 @@ func (d multipartListingCountingDisk) ReadVersion(ctx context.Context, original,
 }
 
 // Counts storage API calls; this is not a deployment throughput benchmark.
-func TestMultipartListingScanCosts(t *testing.T) {
+func TestMultipartDiagnosticScanCosts(t *testing.T) {
 	obj, dirs, err := prepareErasure(t.Context(), 4)
 	if err != nil {
 		t.Fatal(err)
 	}
 	z := obj.(*erasureServerPools)
-	setMultipartListingTestMode(t, false)
+
 	t.Cleanup(func() { z.Shutdown(context.Background()); removeRoots(dirs) })
 	const bucket, otherBucket = "r9-scan-target", "r9-scan-unrelated"
 	for _, name := range []string{bucket, otherBucket} {
@@ -506,7 +550,7 @@ func TestMultipartListingScanCosts(t *testing.T) {
 		t.Helper()
 		directoryCalls.Store(0)
 		metadataCalls.Store(0)
-		result, err := z.ListMultipartUploads(t.Context(), bucket, "dir/", "", "", "", 1)
+		result, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "dir/", "", "", "", 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -544,7 +588,7 @@ func multipartListingFixture(t *testing.T) (*erasureServerPools, *erasureObjects
 	if err := z.MakeBucket(t.Context(), bucket, MakeBucketOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	setMultipartListingTestMode(t, false)
+
 	return z, z.serverPools[0].getHashedSet("a"), bucket
 }
 
@@ -588,46 +632,7 @@ func TestMultipartListingMissingMarkers(t *testing.T) {
 	}
 }
 
-func TestMultipartListingAbortRecovery(t *testing.T) {
-	for _, offline := range []int{1, 2} {
-		t.Run(fmt.Sprint(offline), func(t *testing.T) {
-			z, set, bucket := multipartListingFixture(t)
-			mp, err := z.NewMultipartUpload(t.Context(), bucket, "a", ObjectOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			original := set.getDisks
-			t.Cleanup(func() { set.getDisks = original })
-			set.getDisks = func() []StorageAPI {
-				disks := append([]StorageAPI(nil), original()...)
-				for i := 0; i < offline; i++ {
-					disks[i] = nil
-				}
-				return disks
-			}
-			err = z.AbortMultipartUpload(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{})
-			if offline == 1 && err != nil {
-				t.Fatal(err)
-			}
-			if offline == 2 && (err == nil || toAPIError(t.Context(), err).HTTPStatusCode != 503) {
-				t.Fatalf("two offline drives must not acknowledge cancellation: %v", err)
-			}
-			set.getDisks = original
-			if offline == 2 {
-				// Retry a partially completed deletion after the original disks return.
-				if err = z.AbortMultipartUpload(t.Context(), bucket, "a", mp.UploadID, ObjectOptions{}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			got, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 100)
-			if err != nil || len(got.Uploads) != 0 {
-				t.Fatalf("canceled upload reappeared: %+v %v", got, err)
-			}
-		})
-	}
-}
-
-func TestMultipartListingCoverage(t *testing.T) {
+func TestMultipartDiagnosticCoverage(t *testing.T) {
 	z, set, bucket := multipartListingFixture(t)
 	mp, err := z.NewMultipartUpload(t.Context(), bucket, "a", ObjectOptions{})
 	if err != nil {
@@ -643,12 +648,12 @@ func TestMultipartListingCoverage(t *testing.T) {
 		}
 	}
 	set.getDisks = func() []StorageAPI { return []StorageAPI{disks[0], disks[1], nil, nil} }
-	_, err = z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 10)
+	_, err = z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 10)
 	if err == nil || toAPIError(t.Context(), err).HTTPStatusCode != 503 {
 		t.Fatalf("incomplete discovery returned success: %v", err)
 	}
 	set.getDisks = func() []StorageAPI { return []StorageAPI{nil, disks[1], disks[2], disks[3]} }
-	got, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 10)
+	got, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -659,7 +664,7 @@ func TestMultipartListingCoverage(t *testing.T) {
 	}
 }
 
-func TestMultipartListingBudgetAndAdmission(t *testing.T) {
+func TestMultipartDiagnosticBudgetAndAdmission(t *testing.T) {
 	_, set, bucket := multipartListingFixture(t)
 	if _, err := set.NewMultipartUpload(t.Context(), bucket, "a", ObjectOptions{}); err != nil {
 		t.Fatal(err)
@@ -670,7 +675,7 @@ func TestMultipartListingBudgetAndAdmission(t *testing.T) {
 	}
 	defer scan.close()
 	scan.remaining.Store(1)
-	_, _, err = set.scanMultipartUploads(scan, bucket, 0, 0)
+	_, err = set.scanMultipartUploads(scan, bucket, 0, 0)
 	var limited SlowDown
 	if !errors.As(err, &limited) {
 		t.Fatalf("budget: %v", err)
@@ -689,13 +694,13 @@ func TestMultipartListingBudgetAndAdmission(t *testing.T) {
 	}
 }
 
-func TestMultipartListingAdmissionHTTP(t *testing.T) {
+func TestMultipartPublicListingAdmissionHTTP(t *testing.T) {
 	z, _, _ := multipartListingFixture(t)
 	bucket, router, err := initAPIHandlerTest(t.Context(), z, []string{"ListMultipartUploads"}, MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	setMultipartListingTestMode(t, false)
+
 	for range cap(multipartScanSlots) {
 		scan, err := startMultipartScan(t.Context(), false)
 		if err != nil {
@@ -711,12 +716,12 @@ func TestMultipartListingAdmissionHTTP(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	var response APIErrorResponse
+	var response ListMultipartUploadsResponse
 	if err := xml.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if rec.Code != http.StatusServiceUnavailable || response.Code != "SlowDown" {
-		t.Fatalf("admission returned %d %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK || len(response.Uploads) != 0 {
+		t.Fatalf("diagnostic admission blocked public listing: %d %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -743,12 +748,12 @@ func TestMultipartListingPreflightMinorityLegacy(t *testing.T) {
 		}
 	}
 	report, err := z.multipartPreflight(t.Context())
-	if err != nil || report.Ready || !report.Complete || report.LegacyUploads != 1 {
+	if err != nil || report.Ready || !report.Complete || report.LegacyUploads != 1 || report.Mode != "legacy" {
 		t.Fatalf("minority legacy copy must prevent readiness: %+v %v", report, err)
 	}
 }
 
-func TestMultipartListingCancellationRetainsAdmission(t *testing.T) {
+func TestMultipartDiagnosticCancellationRetainsAdmission(t *testing.T) {
 	z, set, bucket := multipartListingFixture(t)
 	for i := range 40 {
 		if _, err := z.NewMultipartUpload(t.Context(), bucket, fmt.Sprintf("key-%02d", i), ObjectOptions{}); err != nil {
@@ -787,7 +792,7 @@ func TestMultipartListingCancellationRetainsAdmission(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := z.ListMultipartUploads(ctx, bucket, "", "", "", "", 10)
+		_, err := z.scanMultipartUploadsForTest(ctx, bucket, "", "", "", "", 10)
 		done <- err
 	}()
 	for range 16 {

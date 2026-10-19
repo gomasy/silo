@@ -249,8 +249,10 @@ func (a adminAPIHandlers) AddServiceAccountLDAP(w http.ResponseWriter, r *http.R
 
 		// In case of LDAP/OIDC we need to set `opts.claims` to ensure
 		// it is associated with the LDAP/OIDC user properly.
+		// The new credential's policy comes from the request, not the caller.
 		for k, v := range cred.Claims {
-			if k == expClaim {
+			switch k {
+			case expClaim, policy.SessionPolicyName, sessionPolicyNameExtracted, iamPolicyClaimNameSA():
 				continue
 			}
 			opts.claims[k] = v

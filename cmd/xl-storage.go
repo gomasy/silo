@@ -2925,7 +2925,15 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		// if its a partial rename() do not attempt to delete recursively.
 		// this can be healed since all parts are available.
 		s.deleteFile(dstVolumeDir, dstDataPath, false, false)
-		return res, osErrToFileErr(err)
+		err = osErrToFileErr(err)
+		if errors.Is(err, errFileNotFound) {
+			// The staged xl.meta disappeared between staging and commit.
+			// This is a write-quorum failure, not a missing object; use a
+			// dedicated error so the object layer returns 503 instead of
+			// mapping it to ObjectNotFound (404).
+			err = errCommitMetaMissing
+		}
+		return res, err
 	}
 
 	if srcVolume != minioMetaMultipartBucket {

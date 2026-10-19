@@ -711,6 +711,11 @@ func (store *IAMStoreSys) LoadIAMCache(ctx context.Context, firstTime bool) erro
 		if err := store.loadUsers(ctx, svcUser, newCache.iamUsersMap); err != nil {
 			return err
 		}
+		// Rebuild STS revisions as well: a missed etcd watch event must not
+		// leave a cached token valid or hide its tombstone after a restart.
+		if err := store.loadUsers(ctx, stsUser, newCache.iamSTSAccountsMap); err != nil {
+			return err
+		}
 
 		newCache.buildUserGroupMemberships()
 	}
@@ -752,6 +757,14 @@ func (store *IAMStoreSys) LoadIAMCache(ctx context.Context, firstTime bool) erro
 		})
 
 		cache.updatedAt = time.Now()
+	}
+
+	// Revision loading is independent of cache replacement. Even if ongoing
+	// IAM writes defer the full swap, a missed STS notification must converge.
+	for key := range cache.iamSTSAccountsMap {
+		if store.revisionIndex().get(getUserIdentityPath(key, stsUser)).Deleted {
+			delete(cache.iamSTSAccountsMap, key)
+		}
 	}
 
 	return nil
@@ -2184,45 +2197,68 @@ func (store *IAMStoreSys) SetTempUser(ctx context.Context, accessKey string, cre
 
 // RevokeTokens - revokes all temporary credentials, or those with matching type,
 // associated with the parent user.
-func (store *IAMStoreSys) RevokeTokens(ctx context.Context, parentUser string, tokenRevokeType string) error {
+func (store *IAMStoreSys) RevokeTokens(ctx context.Context, parentUser string, tokenRevokeType string) ([]string, error) {
 	if parentUser == "" {
-		return errInvalidArgument
+		return nil, errInvalidArgument
 	}
-
+	before := UTCNow()
 	cache := store.lock()
 	defer store.unlock()
-
 	secret, err := getTokenSigningKey()
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	var revoked bool
-	for _, ui := range cache.iamSTSAccountsMap {
-		if ui.Credentials.ParentUser != parentUser {
+	// Another node may have issued a token whose notification was lost.
+	// Enumerate durable identities, retaining cached entries for retrying a
+	// partially propagated revocation. Do not hold up cached authentication.
+	accounts := maps.Clone(cache.iamSTSAccountsMap)
+	if err := store.withIAMStorage(ctx, func(ctx context.Context) error {
+		return store.loadUsers(ctx, stsUser, accounts)
+	}); err != nil {
+		return nil, err
+	}
+	var revoked []string
+	var failures []error
+	for key, ui := range accounts {
+		if ui.Credentials.ParentUser != parentUser || ui.UpdatedAt.After(before) || ui.Credentials.IsExpired() {
 			continue
 		}
 		if tokenRevokeType != "" {
 			claims, err := getClaimsFromTokenWithSecret(ui.Credentials.SessionToken, secret)
 			if err != nil {
-				continue // skip if token is invalid
+				continue
 			}
-			// skip if token type is given and does not match
 			if v, _ := claims.Lookup(tokenRevokeTypeClaim); v != tokenRevokeType {
 				continue
 			}
 		}
-		if err := store.deleteUserIdentity(ctx, ui.Credentials.AccessKey, stsUser); err != nil {
-			return err
+		if err := store.deleteUserIdentity(ctx, key, stsUser); err != nil {
+			failures = append(failures, err)
+			continue
 		}
-		delete(cache.iamSTSAccountsMap, ui.Credentials.AccessKey)
-		revoked = true
+		delete(cache.iamSTSAccountsMap, key)
+		revoked = append(revoked, key)
 	}
-
-	if revoked {
+	if len(revoked) != 0 {
 		cache.updatedAt = time.Now()
 	}
+	return revoked, errors.Join(failures...)
+}
 
+// revokeTempUser applies an immutable token's replicated tombstone without
+// touching the parent, its policies, or other (including newer) tokens.
+func (store *IAMStoreSys) revokeTempUser(ctx context.Context, key string, expiresAt time.Time) error {
+	cache := store.lock()
+	defer store.unlock()
+	u := UserIdentity{Version: 1, Deleted: true, ExpiresAt: expiresAt}
+	if err := store.saveUserIdentity(ctx, key, stsUser, &u); err != nil {
+		return err
+	}
+	delete(cache.iamSTSAccountsMap, key)
+	cache.updatedAt = time.Now()
+	if store.group != nil {
+		store.group.Forget(key)
+	}
 	return nil
 }
 

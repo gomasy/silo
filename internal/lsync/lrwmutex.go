@@ -115,7 +115,13 @@ func (lm *LRWMutex) lockLoop(ctx context.Context, id, source string, timeout tim
 			if lm.lock(id, source, isWriteLock) {
 				return true
 			}
-			time.Sleep(time.Duration(r.Float64() * float64(lockRetryInterval)))
+			timer := time.NewTimer(time.Duration(r.Float64() * float64(lockRetryInterval)))
+			select {
+			case <-retryCtx.Done():
+				timer.Stop()
+				return false
+			case <-timer.C:
+			}
 		}
 	}
 }

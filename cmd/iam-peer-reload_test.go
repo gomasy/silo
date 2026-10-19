@@ -24,6 +24,8 @@ func TestIAMPeerDeleteNotificationReloadsCommittedState(t *testing.T) {
 			resetTestGlobals()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			// Both caches use object storage, independent of earlier etcd suites.
+			globalEtcdClient = nil
 			obj, disk, err := prepareFS(ctx)
 			if err != nil {
 				t.Fatal(err)

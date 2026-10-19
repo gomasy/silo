@@ -616,6 +616,12 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, idx int, bu
 	}
 
 	if objInfo.isMultipart() {
+		// Completion repeats this check under the object write lock.
+		if _, err := z.checkDataMovementCopies(ctx, bucket, encodeDirObject(objInfo.Name), ObjectOptions{
+			VersionID: objInfo.VersionID, MTime: objInfo.ModTime, SrcPoolIdx: idx,
+		}); err != nil {
+			return err
+		}
 		res, err := z.NewMultipartUpload(ctx, bucket, objInfo.Name, ObjectOptions{
 			VersionID:    objInfo.VersionID,
 			UserDefined:  migrationObjectMetadata(objInfo),
@@ -656,6 +662,7 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, idx int, bu
 			}
 		}
 		_, err = z.CompleteMultipartUpload(ctx, bucket, objInfo.Name, res.UploadID, parts, ObjectOptions{
+			VersionID:    objInfo.VersionID,
 			SrcPoolIdx:   idx,
 			DataMovement: true,
 			MTime:        objInfo.ModTime,
@@ -825,27 +832,17 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			// to create the appropriate stack.
 			versionsSorter(fivs.Versions).reverse()
 
-			var decommissioned, expired int
+			var decommissioned int
 			for _, version := range fivs.Versions {
 				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionObject, idx, bi.Name, version.Name, version.VersionID)
 				// Apply lifecycle rules on the objects that are expired.
 				if filterLifecycle(bi.Name, version.Name, version) {
-					expired++
 					decommissioned++
 					stopFn(version.Size, errors.New("ILM expired object/version will be skipped"))
 					continue
 				}
 
-				// any object with only single DEL marker we don't need
-				// to decommission, just skip it, this also includes
-				// any other versions that have already expired.
-				remainingVersions := len(fivs.Versions) - expired
-				if version.Deleted && remainingVersions == 1 && rcfg == nil {
-					decommissioned++
-					stopFn(version.Size, errors.New("DELETE marked object with no other non-current versions will be skipped"))
-					continue
-				}
-
+				// Preserve every marker: older versions may live in another pool.
 				versionID := version.VersionID
 				if versionID == "" {
 					versionID = nullVersionID
@@ -870,6 +867,9 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 							SkipDecommissioned: true, // make sure we skip the decommissioned pool
 							NoAuditLog:         true,
 						})
+					if isDataMovementSuperseded(err) {
+						err = nil
+					}
 					if err != nil {
 						// This can happen when rebalance stop races with ongoing rebalance workers.
 						// These rebalance failures can be ignored.
@@ -898,17 +898,19 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 				// gr.Close() is ensured by decommissionObject().
 				for range 3 {
 					if version.IsRemote() {
-						if err := z.DecomTieredObject(ctx, bi.Name, version.Name, version, ObjectOptions{
+						err := z.DecomTieredObject(ctx, bi.Name, version.Name, version, ObjectOptions{
 							VersionID:    versionID,
 							MTime:        version.ModTime,
 							UserDefined:  version.Metadata,
 							SrcPoolIdx:   idx,
 							DataMovement: true,
-						}); err != nil {
-							if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
-								ignore = true
-								stopFn(0, nil)
-							}
+						})
+						if isDataMovementSuperseded(err) {
+							err = nil
+						}
+						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
+							ignore = true
+							stopFn(0, nil)
 						}
 						if !ignore {
 							stopFn(version.Size, err)
@@ -949,7 +951,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 						stopFn(version.Size, err)
 						continue
 					}
-					if err = z.decommissionObject(ctx, idx, bi.Name, gr); err != nil {
+					if err = z.decommissionObject(ctx, idx, bi.Name, gr); err != nil && !isDataMovementSuperseded(err) {
 						if isErrObjectNotFound(err) || isErrVersionNotFound(err) || isDataMovementOverWriteErr(err) {
 							ignore = true
 							stopFn(0, nil)
@@ -979,15 +981,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			// if all versions were decommissioned, then we can delete the object versions.
 			if decommissioned == len(fivs.Versions) {
 				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionRemoveObject, idx, bi.Name, entry.name)
-				_, err := set.DeleteObject(ctx,
-					bi.Name,
-					encodeDirObject(entry.name),
-					ObjectOptions{
-						DeletePrefix:       true, // use prefix delete to delete all versions at once.
-						DeletePrefixObject: true, // use prefix delete on exact object (this is an optimization to avoid fan-out calls)
-						NoAuditLog:         true,
-					},
-				)
+				err := z.removeMovedVersions(ctx, bi.Name, entry.name, idx, fivs.Versions)
 				stopFn(0, err)
 				auditLogDecom(ctx, "DecomDeleteObject", bi.Name, entry.name, "", err)
 				if err != nil {
@@ -1193,10 +1187,6 @@ func (z *erasureServerPools) checkAfterDecom(ctx context.Context, idx int) error
 				for _, version := range fivs.Versions {
 					// Apply lifecycle rules on the objects that are expired.
 					if filterLifecycle(bi.Name, version.Name, version) {
-						ignored++
-						continue
-					}
-					if version.Deleted {
 						ignored++
 						continue
 					}

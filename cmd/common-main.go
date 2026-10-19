@@ -56,6 +56,7 @@ import (
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config"
+	"github.com/minio/minio/internal/config/api"
 	"github.com/minio/minio/internal/handlers"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
@@ -881,6 +882,9 @@ func serverHandleEnvVars() {
 		logger.Warning("%s=%s is ignored: Silo in-place updates are permanently disabled", config.EnvUpdate, updateSetting)
 	}
 	globalInplaceUpdateDisabled = true
+	if env.IsSet(api.EnvAPIMultipartListing) {
+		logger.Warning("%s is ignored: multipart listing uses the legacy cache/exact-key behavior; persistent listing is deferred", api.EnvAPIMultipartListing)
+	}
 
 	// Check if the supported credential env vars,
 	// "MINIO_ROOT_USER" and "MINIO_ROOT_PASSWORD" are provided

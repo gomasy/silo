@@ -11,6 +11,33 @@ fail() {
 	exit 1
 }
 
+# Git is already a build prerequisite. --no-index also scans untracked files
+# and exported source trees. As before, honor .gitignore only in a worktree.
+search_ignore=--no-exclude-standard
+if git rev-parse --show-toplevel >/dev/null 2>&1; then
+	search_ignore=--exclude-standard
+fi
+search_errors="$(mktemp)"
+trap 'rm -f "${search_errors}"' EXIT
+
+search_text() {
+	local status=0
+	git --no-pager grep --no-index "${search_ignore}" --no-color -nIHE "$@" 2>"${search_errors}" || status=$?
+	# Git can return 1 for both no matches and a file read error. Check stderr
+	# as well, before callers filter matches through their allowlists.
+	if [ "${status}" -gt 1 ] || [ -s "${search_errors}" ]; then
+		cat "${search_errors}" >&2
+		fail "could not scan source files"
+	fi
+}
+
+# Keep hidden files and build output out of the repository-wide scans.
+source_excludes=(
+	':(exclude,glob)**/.*'
+	':(exclude,glob)**/.*/**'
+	':(exclude)dist/**'
+)
+
 require_file() {
 	[ -f "$1" ] || fail "missing required file: $1"
 }
@@ -152,7 +179,11 @@ if grep -Ev '^[[:space:]]*(#|$)' silo.env | grep -q '='; then
 	fail "silo.env must not contain active assignments that shadow /etc/default/minio"
 fi
 
-if rg -n 'pgsty/minio:' .github/workflows Dockerfile.goreleaser helm/silo; then
+delivery_hits="$(search_text 'pgsty/minio:' -- .github/workflows Dockerfile.goreleaser helm/silo \
+	':(exclude,glob).github/workflows/**/.*' ':(exclude,glob).github/workflows/**/.*/**' \
+	':(exclude,glob)helm/silo/**/.*' ':(exclude,glob)helm/silo/**/.*/**')"
+if [ -n "${delivery_hits}" ]; then
+	printf '%s\n' "${delivery_hits}" >&2
 	fail "an active delivery surface still publishes the frozen pgsty/minio image"
 fi
 
@@ -165,10 +196,10 @@ fi
 # So two rules. First, no live URL may resolve to the old repository anywhere,
 # READMEs and CONTRIBUTORS.md included.
 old_repo_pattern='pgsty/minio(\.git)?([^[:alnum:]_.-]|$)'
-stale_repo_url="$(rg -n -e "github\.com/${old_repo_pattern}" -e "hub\.docker\.com/r/${old_repo_pattern}" \
-	--glob '!.git/**' --glob '!dist/**' \
-	--glob '!SILO_REBRANDING_MIGRATION.md' \
-	--glob '!buildscripts/rebrand-guard/compat-baseline.json' . |
+stale_repo_url="$(search_text -e "github\.com/${old_repo_pattern}" -e "hub\.docker\.com/r/${old_repo_pattern}" -- . \
+	"${source_excludes[@]}" ':(exclude)SILO_REBRANDING_MIGRATION.md' \
+	':(exclude)buildscripts/rebrand-guard/compat-baseline.json')"
+stale_repo_url="$(printf '%s\n' "${stale_repo_url}" |
 	sed 's#^\./##' | grep -v '^buildscripts/verify-rebrand\.sh:' || true)"
 if [ -n "${stale_repo_url}" ]; then
 	printf '%s\n' "${stale_repo_url}" >&2
@@ -180,32 +211,32 @@ fi
 # legacy image, the two READMEs that document the rename and the archived
 # minio branch, and historical issue titles in CONTRIBUTORS.md.
 repo_guard_allowlist='^(buildscripts/minio-upgrade\.sh|buildscripts/verify-rebrand\.sh|buildscripts/helm-migration-guard/main\.go|README\.md|README_ZH\.md|CONTRIBUTORS\.md):'
-stale_repo="$(rg -n "${old_repo_pattern}" --glob '!.git/**' --glob '!dist/**' \
-	--glob '!SILO_REBRANDING_MIGRATION.md' \
-	--glob '!buildscripts/rebrand-guard/compat-baseline.json' . |
+stale_repo="$(search_text "${old_repo_pattern}" -- . "${source_excludes[@]}" \
+	':(exclude)SILO_REBRANDING_MIGRATION.md' ':(exclude)buildscripts/rebrand-guard/compat-baseline.json')"
+stale_repo="$(printf '%s\n' "${stale_repo}" |
 	sed 's#^\./##' | grep -Ev "${repo_guard_allowlist}" || true)"
 if [ -n "${stale_repo}" ]; then
 	printf '%s\n' "${stale_repo}" >&2
 	fail "a source reference still names the pre-rename pgsty/minio repository"
 fi
 
-stale_branch="$(rg -n 'pgsty/silo/(blob/|tree/|raw/)?master' \
-	--glob '!.git/**' --glob '!dist/**' . || true)"
+stale_branch="$(search_text 'pgsty/silo/(blob/|tree/|raw/)?master' -- . "${source_excludes[@]}")"
 if [ -n "${stale_branch}" ]; then
 	printf '%s\n' "${stale_branch}" >&2
 	fail "a link still targets the retired master branch; raw and Actions URLs do not follow a branch rename"
 fi
 
 for workflow in .github/workflows/go.yml .github/workflows/vulncheck.yml; do
-	if rg -q '^\s+- master$' "${workflow}"; then
+	stale_filter="$(search_text '^[[:space:]]+- master$' -- "${workflow}")"
+	if [ -n "${stale_filter}" ]; then
 		fail "${workflow} still filters on master and would go silently dormant on main"
 	fi
 	require_text "${workflow}" "      - main"
 done
 
-network_hits="$(rg -n --glob '*.go' --glob '!**/*_test.go' \
-	'https?://[^"`[:space:]]*(dl\.min\.io|subnet\.min\.io|api\.min\.io|slack\.min\.io|play\.min\.io)' \
-	cmd internal || true)"
+network_hits="$(search_text \
+	'https?://[^"`[:space:]]*(dl\.min\.io|subnet\.min\.io|api\.min\.io|slack\.min\.io|play\.min\.io)' -- \
+	':(glob)cmd/**/*.go' ':(glob)internal/**/*.go' ':(exclude,glob)**/*_test.go' "${source_excludes[@]}")"
 network_hits="$(printf '%s\n' "${network_hits}" | grep -Ev '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
 if [ -n "${network_hits}" ]; then
 	printf '%s\n' "${network_hits}" >&2

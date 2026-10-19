@@ -2,12 +2,34 @@
 
 ## Unreleased
 
-Preparation target: `RELEASE.2026-09-16T00-00-00Z` (package version
-`20260916000000.0.0`). The entries below describe the candidate changes since
-the latest published Server.
-**The latest published Server remains 20260903.** These changes are not in its
-binaries, packages or images. See the [component matrix](https://silo.pgsty.com/compatibility/versions/)
-and [complete commit range](https://github.com/pgsty/silo/compare/RELEASE.2026-09-03T13-18-01Z...main).
+Preparation target: `RELEASE.2026-10-18T00-00-00Z` (package version
+`20261018000000.0.0`). **This is a tag and Draft preparation; it is not a public
+Server release.** The latest published Server remains 20260916. Server 20261015
+also remains a Draft. Existing binaries, packages and images do not change.
+See the [component matrix](https://silo.pgsty.com/compatibility/versions/) and
+[changes since the public release](https://github.com/pgsty/silo/compare/RELEASE.2026-09-16T00-00-00Z...main).
+
+### October 18 dependency update
+
+- Select silo-pkg v3.14.3, upstream minio-go v7.4.1, published mcli 20261018
+  and Console v2.4.2 source (`ef2dd2c41d21`). The SDK includes cancellation cleanup, UTC retention
+  timestamps and preserved STS duration; parallel GET/Compose remain opt-in.
+- Adopt silo-pkg's faster admin-action classification during policy evaluation,
+  preserving authorization behavior and compatibility with existing clients.
+  Update the standalone `reorder-disks` debugging module to the same package version.
+- Build with Go 1.27.2 and refresh Go x/* modules. Apply go-jose v4.1.6,
+  LDAP v3.4.15, compress v1.20.3, msgp v1.6.5, etcd v3.7.2, fwd v1.2.1 and
+  cpuid v2.4.1 bug/security fixes. OIDC JWK RSA keys must not exceed 4096 bits.
+- Update the bundled mcli archive hashes, installation helper and Helm client
+  image to the published 20261018 release. Server Helm image defaults retain the
+  public 20260916 version until a Server image is published.
+- Refresh pinned UBI 9 images and use GoReleaser v2.18.3, nFPM v2.48.0,
+  golangci-lint v2.15.0 and govulncheck v1.9.0. Keep the NetBSD go-systemd
+  v22.6.0 compatibility replacement.
+
+The sections below retain the cumulative maintenance history, including changes
+already shipped in 20260916; the source comparison above identifies this
+candidate's exact delta.
 
 ### Authorization and security
 
@@ -54,35 +76,26 @@ and [complete commit range](https://github.com/pgsty/silo/compare/RELEASE.2026-0
 
 ### Object storage and replication
 
-- Make `ListMultipartUploads` discover quorum-valid uploads from durable state
-  across pools, erasure sets and drives, then apply S3 prefix, delimiter,
-  marker, ordering and 1,000-entry pagination semantics globally (#198). New uploads
-  store their canonical bucket and key as reserved fields in the existing
-  quorum-written `xl.meta`; completion removes those upload-only fields. Native
-  markers remain usable after their upload is completed or canceled. Strict
-  listing returns a diagnostic 503 for legacy uploads or uncertain coverage;
-  the default remains the released exact-key/cache-based `legacy` behavior.
-  Opt into strict mode only through `MINIO_API_MULTIPART_LISTING=strict`, after
-  upgrading every writer, draining old uploads, checking the read-only admin
-  `multipart-preflight` report and validating scan capacity. The process-only
-  setting is not persisted into shared API configuration. Historical
-  `multipart_listing` keys are ignored and can be removed with a targeted
-  `mcli admin config reset ALIAS api multipart_listing` before rollback. Per-process
-  admission, directory-entry, worker and time budgets bound scan scheduling;
-  each page still scans durable state. See [issue #79](https://github.com/pgsty/silo/issues/79)
-  and its [design record](https://silo.pgsty.com/blog/design/list-multipart-uploads/).
-  Thanks to mr javad seydi (@mrjavadseydi) for the original implementation.
-- Retain released read-quorum and best-effort multipart cancellation in default
-  legacy mode. Strict mode requires majority deletion acknowledgements and
-  permits retries below read quorum. When most drives were already empty,
-  failed deletion of an observed remnant now returns 503 instead of being
-  masked by empty-drive successes. Wrong-key or wrong-bucket cancellation
-  preserves the valid upload's cache entry; successful cancellation notifies
-  peers with the request context after the distributed lock is released.
-  The HTTP response for an absent
-  upload remains 204; this is not proof of physical cleanup. **Known boundary:**
-  delayed creation writes can still restore an upload after cancellation;
-  this change does not add a durable creation fence.
+- Withdraw default persistent `ListMultipartUploads` scanning (#79). Restore
+  node-local cache listing for an empty prefix and exact-key lookup otherwise;
+  restart omissions, true-prefix and cache-pagination limitations remain.
+  Preserve bucket/key identity metadata, path safety and stale-upload cleanup.
+  `MINIO_API_MULTIPART_LISTING` stays retired and ignored with a startup warning;
+  obsolete shared `api multipart_listing` keys remain tolerated. **Existing
+  opt-in strict users lose durable listing and strict cancellation.** The
+  read-only admin `multipart-preflight` reports `mode=legacy`; its scan budgets
+  and readiness do not gate public listing or startup. Durable, complete,
+  scalable enumeration remains deferred. See the
+  [design and limits](https://silo.pgsty.com/blog/design/list-multipart-uploads/#implementation).
+  Thanks to mr javad seydi (@mrjavadseydi) for the original metadata-and-scan
+  implementation (#198).
+- Keep the default read-quorum, best-effort multipart cancellation and
+  first-matching-pool behavior when retiring the listing switch. The optional
+  strict cancellation branch is removed. Wrong-target protection, upload-ID
+  path validation and peer notification with the request context remain.
+  HTTP 204 for an absent upload remains idempotent and does not prove physical
+  cleanup. **Known boundary:** delayed creation writes can still restore a
+  readable upload after cancellation; this change adds no creation fence.
 - Preserve object tags during multi-pool metadata reconciliation by reading the
   resolved tag field together with its revision (#189). Previously, reconciliation
   could replace existing tags with an empty value.

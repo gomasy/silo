@@ -11,22 +11,21 @@ import (
 	"github.com/minio/minio/internal/config"
 )
 
-func TestMultipartListingMigrationMode(t *testing.T) {
+func TestMultipartListingRetiredConfiguration(t *testing.T) {
 	t.Setenv(EnvAPIRequestsMax, "")
 	t.Setenv(EnvAPISyncEvents, "")
 	t.Setenv(EnvAPIObjectMaxVersions, "")
 	for _, tc := range []struct {
-		name, stored, override, want string
-		invalid                      bool
+		name, stored, override string
 	}{
-		{name: "default", want: "legacy"},
-		{name: "explicit-legacy", override: "legacy", want: "legacy"},
-		{name: "explicit-strict", override: "strict", want: "strict"},
-		{name: "retired-stored-strict", stored: "strict", want: "legacy"},
-		{name: "retired-stored-legacy", stored: "legacy", want: "legacy"},
-		{name: "retired-stored-invalid", stored: "automatic", want: "legacy"},
-		{name: "environment-override", stored: "legacy", override: "strict", want: "strict"},
-		{name: "invalid-environment", stored: "strict", override: "automatic", want: "legacy", invalid: true},
+		{name: "default"},
+		{name: "explicit-legacy", override: "legacy"},
+		{name: "explicit-strict", override: "strict"},
+		{name: "retired-stored-strict", stored: "strict"},
+		{name: "retired-stored-legacy", stored: "legacy"},
+		{name: "retired-stored-invalid", stored: "automatic"},
+		{name: "environment-override", stored: "legacy", override: "strict"},
+		{name: "invalid-environment", stored: "strict", override: "automatic"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(EnvAPIMultipartListing, tc.override)
@@ -38,11 +37,11 @@ func TestMultipartListingMigrationMode(t *testing.T) {
 				kvs.Set(apiMultipartListing, tc.stored)
 			}
 			cfg, err := LookupConfig(kvs)
-			if (err != nil) != tc.invalid || cfg.MultipartListing != tc.want {
-				t.Fatalf("mode=%q err=%v, want %q invalid=%v", cfg.MultipartListing, err, tc.want, tc.invalid)
+			if err != nil {
+				t.Fatalf("retired setting must be ignored: %v", err)
 			}
 			if cfg.RequestsMax != 17 || !cfg.SyncEvents || cfg.ObjectMaxVersions != 71 {
-				t.Fatalf("migration setting discarded unrelated config: %+v", cfg)
+				t.Fatalf("retired setting discarded unrelated config: %+v", cfg)
 			}
 		})
 	}
@@ -58,7 +57,7 @@ func TestMultipartListingConfigPersistence(t *testing.T) {
 	t.Cleanup(func() { config.DefaultKVS = previous })
 	for _, help := range Help {
 		if help.Key == apiMultipartListing {
-			t.Fatal("process-only setting advertised as shared config")
+			t.Fatal("retired setting advertised as shared config")
 		}
 	}
 	for _, input := range []string{
@@ -82,11 +81,11 @@ func TestMultipartListingConfigPersistence(t *testing.T) {
 			}
 			kvs := loaded.Merge()[config.APISubSys][config.Default]
 			if _, present := kvs.Lookup(apiMultipartListing); present {
-				t.Fatal("process-only setting persisted in shared config")
+				t.Fatal("retired setting persisted in shared config")
 			}
 			cfg, err := LookupConfig(kvs)
-			if err != nil || cfg.MultipartListing != "strict" {
-				t.Fatalf("environment mode lost: %+v %v", cfg, err)
+			if err != nil {
+				t.Fatalf("retired environment setting caused failure: %+v %v", cfg, err)
 			}
 			if input != "" && cfg.RequestsMax != 17 {
 				t.Fatalf("unrelated setting lost: %+v", cfg)

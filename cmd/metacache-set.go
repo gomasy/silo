@@ -39,7 +39,6 @@ import (
 	"github.com/minio/minio/internal/bucket/versioning"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/hash"
-	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/pgsty/silo-pkg/v3/console"
 )
 
@@ -423,63 +422,89 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 		retryDelay    = 50 * time.Millisecond
 		retryDelay250 = 250 * time.Millisecond
 	)
+	var lastStateCheck time.Time
+	retryWait := func() error {
+		if contextCanceled(ctx) {
+			return ctx.Err()
+		}
+		// A failed producer cannot publish another block. Check on the first
+		// failure, then at most once per retry interval while it is still running.
+		if time.Since(lastStateCheck) >= retryDelay250 {
+			lastStateCheck = time.Now()
+			if err := o.checkMetacacheState(ctx, rpc); err != nil {
+				return fmt.Errorf("remote listing canceled: %w", err)
+			}
+		}
+		retries++
+		delay := retryDelay250
+		if retries == 1 {
+			delay = retryDelay
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
+	// Probe one online disk per retry, rotating so a missing replica cannot
+	// pin the reader to one disk. A miss only delays the next probe: it never
+	// establishes absence or replaces the quorum read after a probe succeeds.
+	// This bounds missing-block I/O without sleeping once for every disk.
+	nextProbeDisk := 0
+	probePart := func(part int) bool {
+		disks := er.getDisks()
+		for range disks {
+			if contextCanceled(ctx) {
+				return false
+			}
+			i := nextProbeDisk % len(disks)
+			nextProbeDisk = i + 1
+			disk := disks[i]
+			if disk == nil || !disk.IsOnline() {
+				continue
+			}
+			_, err := disk.ReadVersion(ctx, "", minioMetaBucket, o.objectPath(part), "", ReadOptions{})
+			return err == nil
+		}
+		return false
+	}
 
+	retryOtherError := false
 	for {
 		if contextCanceled(ctx) {
 			return entries, ctx.Err()
 		}
 
-		// If many failures, check the cache state.
-		if retries > 10 {
-			err := o.checkMetacacheState(ctx, rpc)
-			if err != nil {
-				return entries, fmt.Errorf("remote listing canceled: %w", err)
-			}
-			retries = 1
-		}
-
 		// All operations are performed without locks, so we must be careful and allow for failures.
-		// Read metadata associated with the object from a disk.
-		if retries > 0 {
-			for _, disk := range er.getDisks() {
-				if disk == nil {
-					continue
-				}
-				if !disk.IsOnline() {
-					continue
-				}
-				_, err := disk.ReadVersion(ctx, "", minioMetaBucket,
-					o.objectPath(0), "", ReadOptions{})
-				if err != nil {
-					time.Sleep(retryDelay250)
-					retries++
-					continue
-				}
-				break
+		if retries > 0 && !retryOtherError && !probePart(0) {
+			if err := retryWait(); err != nil {
+				return entries, err
 			}
-		}
-		retryWait := func() {
-			retries++
-			if retries == 1 {
-				time.Sleep(retryDelay)
-			} else {
-				time.Sleep(retryDelay250)
-			}
+			continue
 		}
 		// Load first part metadata...
 		// Read metadata associated with the object from all disks.
+		retryOtherError = false
 		fi, metaArr, onlineDisks, err := er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(0), ObjectOptions{}, true)
 		if err != nil {
 			switch toObjectErr(err, minioMetaBucket, o.objectPath(0)).(type) {
 			case ObjectNotFound, InsufficientReadQuorum:
-				retryWait()
+				if err := retryWait(); err != nil {
+					return entries, err
+				}
 				continue
 			}
 			// Allow one fast retry for other errors.
 			if retries > 0 {
 				return entries, fmt.Errorf("reading first part metadata: %v", err)
 			}
-			retryWait()
+			retryOtherError = true
+			if err := retryWait(); err != nil {
+				return entries, err
+			}
 			continue
 		}
 
@@ -487,14 +512,9 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 		switch {
 		case err == nil:
 		case errors.Is(err, io.ErrUnexpectedEOF):
-			if retries == 10 {
-				err := o.checkMetacacheState(ctx, rpc)
-				if err != nil {
-					return entries, fmt.Errorf("remote listing canceled: %w", err)
-				}
-				retries = -1
+			if err := retryWait(); err != nil {
+				return entries, err
 			}
-			retryWait()
 			continue
 		case errors.Is(err, io.EOF):
 			return entries, io.EOF
@@ -508,39 +528,19 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			}
 
 			if partN != loadedPart {
-				if retries > 10 {
-					err := o.checkMetacacheState(ctx, rpc)
-					if err != nil {
-						return entries, fmt.Errorf("waiting for next part %d: %w", partN, err)
+				if retries > 0 && !probePart(partN) {
+					if err := retryWait(); err != nil {
+						return entries, err
 					}
-					retries = 1
-				}
-
-				if retries > 0 {
-					// Load from one disk only
-					for _, disk := range er.getDisks() {
-						if disk == nil {
-							continue
-						}
-						if !disk.IsOnline() {
-							continue
-						}
-						_, err := disk.ReadVersion(ctx, "", minioMetaBucket,
-							o.objectPath(partN), "", ReadOptions{})
-						if err != nil {
-							time.Sleep(retryDelay250)
-							retries++
-							continue
-						}
-						break
-					}
+					continue
 				}
 
 				// Load partN metadata...
 				fi, metaArr, onlineDisks, err = er.getObjectFileInfo(ctx, minioMetaBucket, o.objectPath(partN), ObjectOptions{}, true)
 				if err != nil {
-					time.Sleep(retryDelay250)
-					retries++
+					if err := retryWait(); err != nil {
+						return entries, err
+					}
 					continue
 				}
 				loadedPart = partN
@@ -576,13 +576,15 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 			if err != nil && !errors.Is(err, io.EOF) {
 				switch toObjectErr(err, minioMetaBucket, o.objectPath(partN)).(type) {
 				case ObjectNotFound:
-					retries++
-					time.Sleep(retryDelay250)
+					if err := retryWait(); err != nil {
+						return entries, err
+					}
 					continue
 				case InsufficientReadQuorum:
-					retries++
 					loadedPart = -1
-					time.Sleep(retryDelay250)
+					if err := retryWait(); err != nil {
+						return entries, err
+					}
 					continue
 				default:
 					internalLogIf(ctx, err)
@@ -700,9 +702,46 @@ func getQuorumDisks(disks []StorageAPI, infos []DiskInfo, readQuorum int) (newDi
 	return newDisks
 }
 
+// resolveListEntry keeps the existing walk resolution and fallback eligibility.
+// Eligible latest-only disagreements are resolved at the pool merger, where a
+// current absence can replace the entire same-name group, including stale walks.
+func (er *erasureObjects) resolveListEntry(entries metaCacheEntries, errs []error, resolver *metadataResolutionParams) *metaCacheEntry {
+	entry, ok := entries.resolve(resolver)
+	if ok {
+		return entry
+	}
+	if resolver.requestedVersions != 1 {
+		return nil
+	}
+	valid := 0
+	for i := range entries {
+		if !entries[i].isObject() {
+			continue
+		}
+		if _, err := entries[i].xlmeta(); err != nil {
+			continue
+		}
+		valid++
+		if entry == nil {
+			entry = &entries[i]
+		}
+	}
+	for _, err := range errs {
+		if err != nil {
+			valid++
+		}
+	}
+	if entry == nil || valid < resolver.objQuorum {
+		return nil
+	}
+	// This entry exists only in the internal set-to-pool stream. Do not retain
+	// an arbitrary walk snapshot or encode the pending state as metadata.
+	return &metaCacheEntry{name: entry.name, listingSet: er}
+}
+
 // Will return io.EOF if continuing would not yield more results.
 func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) (err error) {
-	defer xioutil.SafeClose(results)
+	// The caller records the terminal error before closing results.
 	o.debugf(color.Green("listPath:")+" with options: %#v", o)
 
 	// get prioritized non-healing disks for listing
@@ -778,8 +817,8 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 		},
 		partial: func(entries metaCacheEntries, errs []error) {
 			// Results Disagree :-(
-			entry, ok := entries.resolve(&resolver)
-			if ok {
+			entry := er.resolveListEntry(entries, errs, &resolver)
+			if entry != nil {
 				select {
 				case <-ctxDone:
 				case results <- *entry:
@@ -809,7 +848,9 @@ func (m *metaCacheRPC) setErr(err string) {
 		// An error is already set.
 		return
 	}
-	meta, _ = m.o.updateMetacacheListing(meta, m.rpc)
+	if updated, err := m.o.updateMetacacheListing(meta, m.rpc); err == nil {
+		meta = updated
+	}
 	*m.meta = meta
 }
 

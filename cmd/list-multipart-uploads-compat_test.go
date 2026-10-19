@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"slices"
 	"testing"
@@ -41,13 +40,13 @@ func requireMultipartUploadKeys(t *testing.T, got ListMultipartsInfo, want ...st
 	}
 }
 
-func TestListMultipartUploadsS3Compatibility(t *testing.T) {
+func TestMultipartDiagnosticScanPagination(t *testing.T) {
 	obj, dirs, err := prepareErasureSets32(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	z := obj.(*erasureServerPools)
-	setMultipartListingTestMode(t, false)
+
 	t.Cleanup(func() {
 		z.Shutdown(t.Context())
 		removeRoots(dirs)
@@ -82,14 +81,14 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 		uploadIDs[object] = mp.UploadID
 	}
 
-	// Durable multipart metadata, rather than this node-local cache, must be
-	// authoritative after a restart or when another node handles the request.
+	// The diagnostic scanner must discover metadata independently of the cache.
+	// These checks do not claim that public listing offers durable pagination.
 	z.mpCache.Range(func(uploadID string, _ MultipartInfo) bool {
 		z.mpCache.Delete(uploadID)
 		return true
 	})
 
-	all, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 100)
+	all, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +97,7 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 		t.Fatalf("complete listing has truncation state: %+v", all)
 	}
 
-	first, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 1)
+	first, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,31 +108,31 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 			objects[0], uploadIDs[objects[0]])
 	}
 
-	rest, err := z.ListMultipartUploads(t.Context(), bucket, "", first.NextKeyMarker, first.NextUploadIDMarker, "", 100)
+	rest, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", first.NextKeyMarker, first.NextUploadIDMarker, "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireMultipartUploadKeys(t, rest, objects[1:]...)
 
-	afterKey, err := z.ListMultipartUploads(t.Context(), bucket, "", objects[1], "", "", 100)
+	afterKey, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", objects[1], "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireMultipartUploadKeys(t, afterKey, objects[2:]...)
 
-	prefixed, err := z.ListMultipartUploads(t.Context(), bucket, "t/", "", "", "", 100)
+	prefixed, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "t/", "", "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireMultipartUploadKeys(t, prefixed, objects[:3]...)
 
-	nested, err := z.ListMultipartUploads(t.Context(), bucket, "t/a_b/", "", "", "", 100)
+	nested, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "t/a_b/", "", "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
 	requireMultipartUploadKeys(t, nested, objects[:2]...)
 
-	grouped, err := z.ListMultipartUploads(t.Context(), bucket, "t/", "", "", SlashSeparator, 100)
+	grouped, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "t/", "", "", SlashSeparator, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +141,7 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 		t.Fatalf("common prefixes = %v, want %v", grouped.CommonPrefixes, want)
 	}
 
-	groupPage, err := z.ListMultipartUploads(t.Context(), bucket, "t/", "", "", SlashSeparator, 1)
+	groupPage, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "t/", "", "", SlashSeparator, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +153,7 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 			groupPage.NextKeyMarker, groupPage.NextUploadIDMarker, groupPage.IsTruncated)
 	}
 
-	groupRest, err := z.ListMultipartUploads(t.Context(), bucket, "t/", groupPage.NextKeyMarker, "", SlashSeparator, 1)
+	groupRest, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "t/", groupPage.NextKeyMarker, "", SlashSeparator, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,8 +181,8 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 	}
 
 	// Simulate an upload written by a pre-upgrade server. Its key cannot be
-	// recovered by scanning the hashed namespace. Strict listing must fail;
-	// the old path is available only through an explicit migration setting.
+	// recovered by scanning the hashed namespace. Omit only that record, and
+	// preserve normal operations when its bucket, key and upload ID are known.
 	legacyObject := objects[1]
 	er := sets.getHashedSet(legacyObject)
 	fi, metadata, err := er.checkUploadIDExists(t.Context(), bucket, legacyObject, uploadIDs[legacyObject], true)
@@ -198,16 +197,25 @@ func TestListMultipartUploadsS3Compatibility(t *testing.T) {
 		er.getUploadIDDir(bucket, legacyObject, uploadIDs[legacyObject]), metadata, fi.WriteQuorum(er.defaultWQuorum())); err != nil {
 		t.Fatal(err)
 	}
-	_, err = z.ListMultipartUploads(t.Context(), bucket, legacyObject, "", "", "", 100)
-	if !errors.Is(err, errMultipartListingLegacy) {
-		t.Fatalf("legacy strict listing: %v", err)
-	}
-	setMultipartListingTestMode(t, true)
-	legacy, err := z.ListMultipartUploads(t.Context(), bucket, legacyObject, "", "", "", 100)
+	legacy, err := z.scanMultipartUploadsForTest(t.Context(), bucket, legacyObject, "", "", "", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireMultipartUploadKeys(t, legacy, legacyObject)
+	requireMultipartUploadKeys(t, legacy)
+	remaining, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireMultipartUploadKeys(t, remaining, objects[2:]...)
+	part, err = z.PutObjectPart(t.Context(), bucket, legacyObject, uploadIDs[legacyObject], 1,
+		mustGetPutObjReader(t, bytes.NewBufferString("old part"), 8, "", ""), ObjectOptions{})
+	if err != nil {
+		t.Fatalf("continue historical upload: %v", err)
+	}
+	if _, err = z.CompleteMultipartUpload(t.Context(), bucket, legacyObject, uploadIDs[legacyObject],
+		[]CompletePart{{PartNumber: 1, ETag: part.ETag}}, ObjectOptions{}); err != nil {
+		t.Fatalf("complete historical upload: %v", err)
+	}
 }
 
 func TestPaginateMultipartUploads(t *testing.T) {
@@ -260,7 +268,7 @@ func TestPaginateMultipartUploads(t *testing.T) {
 
 func TestListMultipartUploadsGlobalPageAcrossPools(t *testing.T) {
 	z, bucket := consistencyPools(t)
-	setMultipartListingTestMode(t, false)
+
 	objects := []string{"a/one", "b/two", "c/three", "d/four"}
 	for i, object := range objects {
 		if _, err := z.serverPools[i%len(z.serverPools)].NewMultipartUpload(t.Context(), bucket, object, ObjectOptions{}); err != nil {
@@ -272,7 +280,7 @@ func TestListMultipartUploadsGlobalPageAcrossPools(t *testing.T) {
 		return true
 	})
 
-	page, err := z.ListMultipartUploads(t.Context(), bucket, "", "", "", "", 2)
+	page, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", "", "", "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +289,7 @@ func TestListMultipartUploadsGlobalPageAcrossPools(t *testing.T) {
 		t.Fatalf("first global page = %+v", page)
 	}
 
-	rest, err := z.ListMultipartUploads(t.Context(), bucket, "", page.NextKeyMarker, page.NextUploadIDMarker, "", 2)
+	rest, err := z.scanMultipartUploadsForTest(t.Context(), bucket, "", page.NextKeyMarker, page.NextUploadIDMarker, "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}

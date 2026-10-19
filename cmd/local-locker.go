@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,14 @@ import (
 // but prevent requests to overload the server completely.
 // Rejected clients are expected to retry.
 const lockMutexWaitLimit = 1000
+
+// A short listing recovery read or conflicting writer may finish before the
+// rejected request retries. Recheck once in the same request, sharing a bound
+// for timers outside the mutex. This is not a queue and gives neither priority.
+const (
+	listingLockWait      = 2 * time.Millisecond
+	listingLockWaitLimit = 64
+)
 
 // lockRequesterInfo stores various info from the client for each lock that is requested.
 type lockRequesterInfo struct {
@@ -65,6 +74,8 @@ type localLocker struct {
 	waitMutex atomic.Int32
 	lockMap   map[string][]lockRequesterInfo
 	lockUID   map[string]string // UUID -> resource map.
+	// Protected by mutex. These waiters are not included in waitMutex.
+	listingWaiters int
 
 	// the following are updated on every cleanup defined in lockValidityDuration
 	readers         atomic.Int32
@@ -96,6 +107,32 @@ func (l *localLocker) canTakeLock(resources ...string) bool {
 	return true
 }
 
+// isListingReadLock recognizes only the existing diagnostic source emitted by
+// listingRLock. Unknown or changed source formats retain immediate rejection;
+// Source is not a new wire contract or proof that the read will finish quickly.
+func isListingReadLock(holders []lockRequesterInfo) bool {
+	if len(holders) == 0 {
+		return false
+	}
+	const prefix = "[metacache-server-pool.go:"
+	const suffix = ":(*erasureServerPools).listingRLock()]"
+	for _, holder := range holders {
+		if holder.Writer || len(holder.Source) <= len(prefix)+len(suffix) || !strings.HasPrefix(holder.Source, prefix) || !strings.HasSuffix(holder.Source, suffix) {
+			return false
+		}
+		line := holder.Source[len(prefix) : len(holder.Source)-len(suffix)]
+		if len(line) == 0 || line[0] == '0' {
+			return false
+		}
+		for _, c := range line {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (l *localLocker) Lock(ctx context.Context, args dsync.LockArgs) (reply bool, err error) {
 	if len(args.Resources) > maxDeleteList {
 		return false, fmt.Errorf("internal error: localLocker.Lock called with more than %d resources", maxDeleteList)
@@ -112,9 +149,33 @@ func (l *localLocker) Lock(ctx context.Context, args dsync.LockArgs) (reply bool
 		return false, ctx.Err()
 	}
 	if !l.canTakeLock(args.Resources...) {
-		// Not all locks can be taken on resources,
-		// reject it completely.
-		return false, nil
+		// Only a single-resource write blocked exclusively by listing recovery
+		// readers gets a short, bounded opportunity to succeed in this attempt.
+		if len(args.Resources) != 1 || l.listingWaiters >= listingLockWaitLimit || !isListingReadLock(l.lockMap[args.Resources[0]]) {
+			return false, nil
+		}
+		l.listingWaiters++
+		l.mutex.Unlock()
+		timer := time.NewTimer(listingLockWait)
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+		timer.Stop()
+		// Restore the mutex before returning to the existing deferred unlock.
+		// Readers or another writer may have entered while it was released.
+		l.getMutex()
+		l.listingWaiters--
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if l.waitMutex.Load() > lockMutexWaitLimit {
+			l.locksOverloaded.Add(1)
+			return false, nil
+		}
+		if !l.canTakeLock(args.Resources...) {
+			return false, nil
+		}
 	}
 
 	// No locks held on the all resources, so claim write
@@ -206,6 +267,31 @@ func (l *localLocker) RLock(ctx context.Context, args dsync.LockArgs) (reply boo
 		return false, ctx.Err()
 	}
 	resource := args.Resources[0]
+	lri, ok := l.lockMap[resource]
+	if ok && isWriteLock(lri) && l.listingWaiters < listingLockWaitLimit && isListingReadLock([]lockRequesterInfo{{Source: args.Source}}) {
+		// Only a positively identified listing read blocked by a writer may
+		// wait once. A long or replacement writer still rejects normally.
+		l.listingWaiters++
+		l.mutex.Unlock()
+		timer := time.NewTimer(listingLockWait)
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+		timer.Stop()
+		// Restore the mutex before the existing deferred unlock, then use
+		// the current holders in the normal read-lock grant path below.
+		l.getMutex()
+		l.listingWaiters--
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if l.waitMutex.Load() > lockMutexWaitLimit {
+			l.locksOverloaded.Add(1)
+			return false, nil
+		}
+		lri, ok = l.lockMap[resource]
+	}
 	now := UTCNow()
 	lrInfo := lockRequesterInfo{
 		Name:            resource,
@@ -217,7 +303,6 @@ func (l *localLocker) RLock(ctx context.Context, args dsync.LockArgs) (reply boo
 		TimeLastRefresh: now.UnixNano(),
 		Quorum:          *args.Quorum,
 	}
-	lri, ok := l.lockMap[resource]
 	if ok {
 		if reply = !isWriteLock(lri); reply {
 			// Unless there is a write lock

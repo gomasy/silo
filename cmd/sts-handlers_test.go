@@ -44,6 +44,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/tags"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/pgsty/silo-pkg/v3/ldap"
+	"github.com/pgsty/silo-pkg/v3/policy"
 )
 
 func runAllIAMSTSTests(suite *TestSuiteIAM, c *check) {
@@ -2384,8 +2385,10 @@ func (s *TestSuiteIAM) TestIAMImport(c *check, exportedContent []byte, caseNum i
 	if err != nil {
 		c.Fatalf("import %d: Unable to list policies: %v", caseNum, err)
 	}
-	defaultCannedPolicies := set.CreateStringSet("consoleAdmin", "readwrite", "readonly",
-		"diagnostics", "writeonly")
+	defaultCannedPolicies := set.CreateStringSet()
+	for _, p := range policy.DefaultPolicies {
+		defaultCannedPolicies.Add(p.Name)
+	}
 	for policy, policyBytes := range policyContentMap {
 		if defaultCannedPolicies.Contains(policy) {
 			continue
@@ -2990,6 +2993,21 @@ func (s *TestSuiteIAM) TestLDAPSTSServiceAccounts(c *check) {
 
 	// 6. Check that service account cannot be created for some other user.
 	c.mustNotCreateSvcAccount(ctx, globalActiveCred.AccessKey, userAdmClient)
+
+	// An empty policy must not contaminate an expiring LDAP child credential.
+	emptyPolicyCred, err := userAdmClient.AddServiceAccountLDAP(ctx, madmin.AddServiceAccountReq{Policy: []byte("null")})
+	if err != nil {
+		c.Fatalf("Unable to create empty-policy LDAP service account: %v", err)
+	}
+	emptyPolicyAdmin := s.getAdminClient(c, emptyPolicyCred.AccessKey, emptyPolicyCred.SecretKey, "")
+	expires := UTCNow().Add(time.Hour)
+	for _, childPolicy := range [][]byte{nil, []byte("null")} {
+		child, err := emptyPolicyAdmin.AddServiceAccountLDAP(ctx, madmin.AddServiceAccountReq{Expiration: &expires, Policy: childPolicy})
+		if err != nil {
+			c.Fatalf("Unable to create expiring LDAP child: %v", err)
+		}
+		c.assertSvcAccS3Access(ctx, s, child, bucket)
+	}
 
 	// Detach the policy from the user
 	if _, err = s.adm.DetachPolicyLDAP(ctx, userReq); err != nil {

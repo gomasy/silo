@@ -714,8 +714,10 @@ func (a adminAPIHandlers) AddServiceAccount(w http.ResponseWriter, r *http.Reque
 
 		// In case of LDAP/OIDC we need to set `opts.claims` to ensure
 		// it is associated with the LDAP/OIDC user properly.
+		// The new credential's policy comes from the request, not the caller.
 		for k, v := range cred.Claims {
-			if k == expClaim {
+			switch k {
+			case expClaim, policy.SessionPolicyName, sessionPolicyNameExtracted, iamPolicyClaimNameSA():
 				continue
 			}
 			opts.claims[k] = v
@@ -855,10 +857,9 @@ func (a adminAPIHandlers) UpdateServiceAccount(w http.ResponseWriter, r *http.Re
 
 	// Permission checks:
 	//
-	// 1. Any type of account (i.e. access keys (previously/still called service
-	// accounts), STS accounts, internal IDP accounts, etc) with the
-	// policy.UpdateServiceAccountAdminAction permission can update any service
-	// account.
+	// 1. Updating requires policy.UpdateServiceAccountAdminAction. Under built-in
+	// IAM, session-limited callers cannot update credentials, and only unrestricted
+	// root credentials can manage root's service accounts.
 	//
 	// 2. We would like to let a user update their own access keys, however it
 	// is currently blocked pending a re-design. Users are still able to delete
@@ -871,6 +872,11 @@ func (a adminAPIHandlers) UpdateServiceAccount(w http.ResponseWriter, r *http.Re
 		IsOwner:         owner,
 		Claims:          cred.Claims,
 	}) {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		return
+	}
+	if newGlobalAuthZPluginFn() == nil && (hasActiveSessionPolicy(cred) ||
+		(svcAccount.ParentUser == globalActiveCred.AccessKey && !canManageRootCredentials(cred))) {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
 		return
 	}
@@ -951,23 +957,21 @@ func (a adminAPIHandlers) InfoServiceAccount(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if !globalIAMSys.IsAllowed(policy.Args{
+	requestUser := cred.AccessKey
+	if cred.ParentUser != "" {
+		requestUser = cred.ParentUser
+	}
+	if !isAllowedServiceAccountAction(cred, policy.Args{
 		AccountName:     cred.AccessKey,
 		Groups:          cred.Groups,
 		Action:          policy.ListServiceAccountsAdminAction,
 		ConditionValues: getConditionValues(r, "", cred),
 		IsOwner:         owner,
 		Claims:          cred.Claims,
+		DenyOnly:        requestUser == svcAccount.ParentUser,
 	}) {
-		requestUser := cred.AccessKey
-		if cred.ParentUser != "" {
-			requestUser = cred.ParentUser
-		}
-
-		if requestUser != svcAccount.ParentUser {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		return
 	}
 
 	// if session policy is nil or empty, then it is implied policy
@@ -1039,29 +1043,27 @@ func (a adminAPIHandlers) ListServiceAccounts(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	var targetAccount string
-
-	// If listing is requested for a specific user (who is not the request
-	// sender), check that the user has permissions.
+	selfUser := cred.AccessKey
+	if cred.ParentUser != "" {
+		selfUser = cred.ParentUser
+	}
 	user := r.Form.Get("user")
-	if user != "" && user != cred.AccessKey {
-		if !globalIAMSys.IsAllowed(policy.Args{
-			AccountName:     cred.AccessKey,
-			Groups:          cred.Groups,
-			Action:          policy.ListServiceAccountsAdminAction,
-			ConditionValues: getConditionValues(r, "", cred),
-			IsOwner:         owner,
-			Claims:          cred.Claims,
-		}) {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
-		targetAccount = user
-	} else {
-		targetAccount = cred.AccessKey
-		if cred.ParentUser != "" {
-			targetAccount = cred.ParentUser
-		}
+	selfOnly := user == "" || user == cred.AccessKey || user == selfUser
+	if !isAllowedServiceAccountAction(cred, policy.Args{
+		AccountName:     cred.AccessKey,
+		Groups:          cred.Groups,
+		Action:          policy.ListServiceAccountsAdminAction,
+		ConditionValues: getConditionValues(r, "", cred),
+		IsOwner:         owner,
+		Claims:          cred.Claims,
+		DenyOnly:        selfOnly,
+	}) {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		return
+	}
+	targetAccount := user
+	if selfOnly {
+		targetAccount = selfUser
 	}
 
 	serviceAccounts, err := globalIAMSys.ListServiceAccounts(ctx, targetAccount)
@@ -1110,7 +1112,7 @@ func (a adminAPIHandlers) DeleteServiceAccount(w http.ResponseWriter, r *http.Re
 
 	// Get current object layer instance.
 	objectAPI := newObjectLayerFn()
-	if objectAPI == nil || globalNotificationSys == nil {
+	if objectAPI == nil || globalNotificationSys == nil || !globalIAMSys.Initialized() {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 		return
 	}
@@ -1131,35 +1133,41 @@ func (a adminAPIHandlers) DeleteServiceAccount(w http.ResponseWriter, r *http.Re
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidArgument), r.URL)
 		return
 	}
-	// We do not care if service account is readable or not at this point,
-	// since this is a delete call we shall allow it to be deleted if possible.
-	svcAccount, _, err := globalIAMSys.GetServiceAccount(ctx, serviceAccount)
-	if errors.Is(err, errNoSuchServiceAccount) {
+	// Deletion needs the stored identity, not a valid token or session policy.
+	// Keep disabled, expired and damaged service accounts removable, and retain
+	// their parent for authorization and the site replication hook below.
+	u, ok := globalIAMSys.store.GetUser(serviceAccount)
+	if !ok || !u.Credentials.IsServiceAccount() {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminServiceAccountNotFound), r.URL)
 		return
 	}
+	svcAccount := u.Credentials
 
-	adminPrivilege := globalIAMSys.IsAllowed(policy.Args{
+	parentUser := cred.AccessKey
+	if cred.ParentUser != "" {
+		parentUser = cred.ParentUser
+	}
+	isSelf := parentUser == svcAccount.ParentUser
+	if !isAllowedServiceAccountAction(cred, policy.Args{
 		AccountName:     cred.AccessKey,
 		Groups:          cred.Groups,
 		Action:          policy.RemoveServiceAccountAdminAction,
 		ConditionValues: getConditionValues(r, "", cred),
 		IsOwner:         owner,
 		Claims:          cred.Claims,
-	})
-
-	if !adminPrivilege {
-		parentUser := cred.AccessKey
-		if cred.ParentUser != "" {
-			parentUser = cred.ParentUser
-		}
-		if svcAccount.ParentUser != "" && parentUser != svcAccount.ParentUser {
-			// The service account belongs to another user but return not
-			// found error to mitigate brute force attacks. or the
-			// serviceAccount doesn't exist.
+		DenyOnly:        isSelf,
+	}) {
+		if !isSelf {
+			// Hide the existence of another user's service account.
 			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminServiceAccountNotFound), r.URL)
 			return
 		}
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		return
+	}
+	if newGlobalAuthZPluginFn() == nil && svcAccount.ParentUser == globalActiveCred.AccessKey && !canManageRootCredentials(cred) {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminServiceAccountNotFound), r.URL)
+		return
 	}
 
 	if err := globalIAMSys.DeleteServiceAccount(ctx, serviceAccount, true); err != nil {
@@ -1229,7 +1237,7 @@ func (a adminAPIHandlers) ListAccessKeysBulk(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	if !globalIAMSys.IsAllowed(policy.Args{
+	if !isAllowedServiceAccountAction(cred, policy.Args{
 		AccountName:     cred.AccessKey,
 		Groups:          cred.Groups,
 		Action:          policy.ListServiceAccountsAdminAction,
@@ -1242,12 +1250,12 @@ func (a adminAPIHandlers) ListAccessKeysBulk(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if selfOnly && len(users) == 0 {
+	if selfOnly {
 		selfUser := cred.AccessKey
 		if cred.ParentUser != "" {
 			selfUser = cred.ParentUser
 		}
-		users = append(users, selfUser)
+		users = []string{selfUser}
 	}
 
 	var checkedUserList []string
@@ -2046,25 +2054,29 @@ func (a adminAPIHandlers) RevokeTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	adminPrivilege := globalIAMSys.IsAllowed(policy.Args{
+	parentUser := cred.AccessKey
+	if cred.ParentUser != "" {
+		parentUser = cred.ParentUser
+	}
+	isSelfTarget := isTokenSelfRevoke || user == parentUser
+	if !isAllowedServiceAccountAction(cred, policy.Args{
 		AccountName:     cred.AccessKey,
 		Groups:          cred.Groups,
 		Action:          policy.RemoveServiceAccountAdminAction,
 		ConditionValues: getConditionValues(r, "", cred),
 		IsOwner:         owner,
 		Claims:          cred.Claims,
-	})
-
-	if !adminPrivilege || isTokenSelfRevoke {
-		parentUser := cred.AccessKey
-		if cred.ParentUser != "" {
-			parentUser = cred.ParentUser
-		}
-		if !isTokenSelfRevoke && user != parentUser {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
+		DenyOnly:        isSelfTarget,
+	}) {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		return
+	}
+	if isSelfTarget {
 		user = parentUser
+	}
+	if newGlobalAuthZPluginFn() == nil && user == globalActiveCred.AccessKey && !canManageRootCredentials(cred) {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		return
 	}
 
 	// Infer token revoke type from the request if requestor is STS.
@@ -2112,29 +2124,22 @@ func (a adminAPIHandlers) InfoAccessKey(w http.ResponseWriter, r *http.Request) 
 	u, ok := globalIAMSys.GetUser(ctx, accessKey)
 	targetCred := u.Credentials
 
-	if !globalIAMSys.IsAllowed(policy.Args{
+	requestUser := cred.AccessKey
+	if cred.ParentUser != "" {
+		requestUser = cred.ParentUser
+	}
+	isSelf := ok && targetCred.ParentUser != "" && requestUser == targetCred.ParentUser
+	if !isAllowedServiceAccountAction(cred, policy.Args{
 		AccountName:     cred.AccessKey,
 		Groups:          cred.Groups,
 		Action:          policy.ListServiceAccountsAdminAction,
 		ConditionValues: getConditionValues(r, "", cred),
 		IsOwner:         owner,
 		Claims:          cred.Claims,
+		DenyOnly:        isSelf,
 	}) {
-		// If requested user does not exist and requestor is not allowed to list service accounts, return access denied.
-		if !ok {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
-
-		requestUser := cred.AccessKey
-		if cred.ParentUser != "" {
-			requestUser = cred.ParentUser
-		}
-
-		if requestUser != targetCred.ParentUser {
-			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
-			return
-		}
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		return
 	}
 
 	if !ok {
@@ -2908,6 +2913,44 @@ func addExpirationToCondValues(exp *time.Time, condValues map[string][]string) e
 	return nil
 }
 
+// hasActiveSessionPolicy follows the same credential dispatch as IAMSys.IsAllowed.
+// Expiring service accounts also satisfy IsTemp and are evaluated as STS there.
+// Callers use this only after authorization under built-in IAM.
+func hasActiveSessionPolicy(cred auth.Credentials) bool {
+	args := policy.Args{Claims: cred.Claims}
+	if cred.IsTemp() {
+		hasSP, _ := isAllowedBySessionPolicy(args)
+		return hasSP
+	}
+	if cred.IsServiceAccount() {
+		if cred.Claims[iamPolicyClaimNameSA()] == inheritedPolicyType {
+			return false
+		}
+		hasSP, _ := isAllowedBySessionPolicyForServiceAccount(args)
+		return hasSP
+	}
+	return false
+}
+
+// canManageRootCredentials is an additional guard after built-in IAM authorization.
+// The signature's owner flag is insufficient: historical empty session policies
+// clear it even though the service account still inherits root's permissions.
+func canManageRootCredentials(cred auth.Credentials) bool {
+	return cred.AccessKey == globalActiveCred.AccessKey ||
+		(cred.ParentUser == globalActiveCred.AccessKey && cred.AccessKey != siteReplicatorSvcAcc && !hasActiveSessionPolicy(cred))
+}
+
+// isAllowedServiceAccountAction preserves regular users' self inspection and
+// cleanup even without a policy attachment, while enforcing explicit denies.
+// Derived credentials and external authorization plugins use full IAM evaluation.
+func isAllowedServiceAccountAction(cred auth.Credentials, args policy.Args) bool {
+	if args.DenyOnly && !args.IsOwner && !cred.IsTemp() && !cred.IsServiceAccount() && newGlobalAuthZPluginFn() == nil {
+		policies, err := globalIAMSys.PolicyDBGet(args.AccountName, args.Groups...)
+		return err == nil && globalIAMSys.GetCombinedPolicy(policies...).IsAllowed(args)
+	}
+	return globalIAMSys.IsAllowed(args)
+}
+
 func commonAddServiceAccount(r *http.Request, ldap bool) (context.Context, auth.Credentials, newServiceAccountOpts, madmin.AddServiceAccountReq, string, APIError) {
 	ctx := r.Context()
 
@@ -2996,12 +3039,26 @@ func commonAddServiceAccount(r *http.Request, ldap bool) (context.Context, auth.
 	}) {
 		return ctx, auth.Credentials{}, newServiceAccountOpts{}, madmin.AddServiceAccountReq{}, "", errorCodes.ToAPIErr(ErrAccessDenied)
 	}
+	effectiveTarget := targetUser
+	if (targetUser == cred.AccessKey || targetUser == cred.ParentUser) && cred.ParentUser != "" {
+		effectiveTarget = cred.ParentUser
+	}
+	if newGlobalAuthZPluginFn() == nil && (hasActiveSessionPolicy(cred) ||
+		(effectiveTarget == globalActiveCred.AccessKey && !canManageRootCredentials(cred))) {
+		return ctx, auth.Credentials{}, newServiceAccountOpts{}, madmin.AddServiceAccountReq{}, "", errorCodes.ToAPIErr(ErrAccessDenied)
+	}
 
 	var sp *policy.Policy
 	if len(createReq.Policy) > 0 {
 		sp, err = policy.ParseConfigStrict(bytes.NewReader(createReq.Policy))
 		if err != nil {
 			return ctx, auth.Credentials{}, newServiceAccountOpts{}, madmin.AddServiceAccountReq{}, "", toAdminAPIErr(ctx, err)
+		}
+		// Empty service policies mean inheritance, including for expiring keys.
+		// Normalize the replication request as well as the local credential.
+		if sp.Version == "" && sp.Statements == nil && sp.ID == "" {
+			sp = nil
+			createReq.Policy = nil
 		}
 	}
 

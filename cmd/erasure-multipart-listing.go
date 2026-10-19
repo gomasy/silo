@@ -23,7 +23,6 @@ const multipartScanEntryLimit = 100_000
 
 var (
 	multipartScanSlots          = make(chan struct{}, 2)
-	errMultipartListingLegacy   = errors.New("legacy multipart uploads require a coordinated upgrade and drain")
 	errMultipartListingIdentity = errors.New("multipart upload identity is invalid")
 )
 
@@ -133,6 +132,14 @@ func (er erasureObjects) multipartIdentity(fi FileInfo, shaDir string) (string, 
 		IsValidObjectPrefix(object) && er.getMultipartSHADir(bucket, object) == shaDir
 }
 
+// Only the absence of both fields identifies the historical format. Empty,
+// partial or invalid identities must not hide a damaged new upload as legacy.
+func multipartLegacyIdentity(fi FileInfo) bool {
+	_, bucketPresent := fi.Metadata[multipartMetaBucket]
+	_, objectPresent := fi.Metadata[multipartMetaObject]
+	return !bucketPresent && !objectPresent
+}
+
 func (er erasureObjects) readMultipartUploadCandidate(s *multipartScan, bucket, candidate string, source StorageAPI) (MultipartInfo, bool, bool, error) {
 	if s.ctx.Err() != nil {
 		return MultipartInfo{}, false, false, SlowDown{}
@@ -162,8 +169,8 @@ func (er erasureObjects) readMultipartUploadCandidate(s *multipartScan, bucket, 
 	disks := er.getDisks()
 	metadata, errs := readAllFileInfo(s.ctx, disks, bucket, minioMetaMultipartBucket, candidate, "", false, false)
 	if s.preflight {
-		// Readiness is stronger than listing liveness: even one readable legacy
-		// copy must be drained, and an unreadable copy cannot certify readiness.
+		// The diagnostic counts even a single readable legacy copy. It does not
+		// gate listing; unreadable copies still prevent a complete diagnosis.
 		var oldest MultipartInfo
 		legacy := false
 		_, nativeID := multipartUploadTime(uploadUUID)
@@ -176,10 +183,11 @@ func (er erasureObjects) readMultipartUploadCandidate(s *multipartScan, bucket, 
 			}
 			fi := metadata[i]
 			storedBucket, storedObject, valid := er.multipartIdentity(fi, shaDir)
-			if storedBucket != "" && storedObject != "" && !valid {
+			isLegacy := multipartLegacyIdentity(fi)
+			if !isLegacy && (!valid || !nativeID) {
 				return MultipartInfo{}, false, false, errMultipartListingIdentity
 			}
-			if !valid || !nativeID {
+			if isLegacy {
 				info := multipartUploadInfo(storedBucket, storedObject, uploadUUID, fi.ModTime)
 				if !legacy || info.Initiated.Before(oldest.Initiated) {
 					oldest = info
@@ -203,16 +211,29 @@ func (er erasureObjects) readMultipartUploadCandidate(s *multipartScan, bucket, 
 	if err != nil {
 		return MultipartInfo{}, false, false, err
 	}
+	// The generic metadata quorum does not compare these identity fields.
+	// Contradictory readable copies cannot certify a historical upload: picking
+	// a copy with missing fields must not silently hide a new-format record.
+	legacy := multipartLegacyIdentity(fi)
 	storedBucket, storedObject, valid := er.multipartIdentity(fi, shaDir)
+	for i, other := range metadata {
+		if errs[i] != nil || !other.IsValid() {
+			continue
+		}
+		if multipartLegacyIdentity(other) != legacy ||
+			(!legacy && (other.Metadata[multipartMetaBucket] != storedBucket || other.Metadata[multipartMetaObject] != storedObject)) {
+			return MultipartInfo{}, false, false, fmt.Errorf("%w: inconsistent copies at %s", errMultipartListingIdentity, candidate)
+		}
+	}
 	info := multipartUploadInfo(storedBucket, storedObject, uploadUUID, fi.ModTime)
-	if storedBucket == "" || storedObject == "" {
+	if legacy {
 		return info, false, true, nil
 	}
 	if !valid {
 		return MultipartInfo{}, false, false, fmt.Errorf("%w: %s", errMultipartListingIdentity, candidate)
 	}
 	if _, ok := multipartUploadTime(uploadUUID); !ok {
-		return info, false, true, nil
+		return MultipartInfo{}, false, false, fmt.Errorf("%w: %s", errMultipartListingIdentity, candidate)
 	}
 	if bucket != "" && bucket != storedBucket {
 		return MultipartInfo{}, false, false, nil
@@ -220,7 +241,7 @@ func (er erasureObjects) readMultipartUploadCandidate(s *multipartScan, bucket, 
 	return info, true, false, nil
 }
 
-func (er erasureObjects) scanMultipartUploads(s *multipartScan, bucket string, poolIdx, setIdx int) ([]MultipartInfo, bool, error) {
+func (er erasureObjects) scanMultipartUploads(s *multipartScan, bucket string, poolIdx, setIdx int) ([]MultipartInfo, error) {
 	disks := er.getDisks()
 	report := multipartScanSet{Pool: poolIdx, Set: setIdx, Drives: er.setDriveCount}
 	var resultErr error
@@ -272,7 +293,7 @@ func (er erasureObjects) scanMultipartUploads(s *multipartScan, bucket string, p
 		resultErr = toObjectErr(errErasureReadQuorum, bucket)
 	}
 	if resultErr != nil {
-		return nil, false, resultErr
+		return nil, resultErr
 	}
 	type candidate struct {
 		path   string
@@ -325,25 +346,23 @@ dispatch:
 	if s.ctx.Err() != nil {
 		resultErr = SlowDown{}
 	}
-	return uploads, report.LegacyUploads != 0, resultErr
+	return uploads, resultErr
 }
 
 // multipartPreflight scans all pools, sets and drives, independent of caches.
-// A majority suffices for normal listing; upgrade readiness requires every
-// drive to have been inspected. The operator must also upgrade all writers.
+// A majority suffices for normal listing; a complete diagnosis requires every
+// drive to have been inspected. Ready describes the absence of legacy copies,
+// not whether listing is enabled.
 func (z *erasureServerPools) multipartPreflight(ctx context.Context) (multipartPreflightReport, error) {
 	s, err := startMultipartScan(ctx, true)
 	if err != nil {
 		return multipartPreflightReport{}, err
 	}
 	defer s.close()
-	report := multipartPreflightReport{Complete: true, Mode: "strict"}
-	if globalAPIConfig.getMultipartListingLegacy() {
-		report.Mode = "legacy"
-	}
+	report := multipartPreflightReport{Complete: true, Mode: "legacy"}
 	for p, pool := range z.serverPools {
 		for i, set := range pool.sets {
-			_, _, _ = set.scanMultipartUploads(s, "", p, i)
+			_, _ = set.scanMultipartUploads(s, "", p, i)
 		}
 	}
 	report.Sets = s.sets

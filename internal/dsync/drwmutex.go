@@ -260,14 +260,22 @@ func (dm *DRWMutex) lockBlocking(ctx context.Context, lockLossCallback func(), i
 				return locked
 			}
 
+			var retryInterval time.Duration
 			switch {
 			case opts.RetryInterval < 0:
 				return false
 			case opts.RetryInterval > 0:
-				time.Sleep(opts.RetryInterval)
+				retryInterval = opts.RetryInterval
 			default:
 				attempt++
-				time.Sleep(lockRetryBackOff(dm.rng, attempt))
+				retryInterval = lockRetryBackOff(dm.rng, attempt)
+			}
+			timer := time.NewTimer(retryInterval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return false
+			case <-timer.C:
 			}
 		}
 	}

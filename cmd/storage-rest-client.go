@@ -106,6 +106,8 @@ func toStorageErr(err error) error {
 		return errVolumeExists
 	case errFileNotFound.Error():
 		return errFileNotFound
+	case errCommitMetaMissing.Error():
+		return errCommitMetaMissing
 	case errFileVersionNotFound.Error():
 		return errFileVersionNotFound
 	case errFileNameTooLong.Error():

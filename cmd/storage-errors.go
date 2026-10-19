@@ -70,6 +70,11 @@ var errDiskAccessDenied = StorageErr("drive access denied")
 // errFileNotFound - cannot find the file.
 var errFileNotFound = StorageErr("file not found")
 
+// errCommitMetaMissing - the staged xl.meta disappeared between the
+// data rename and the meta-file commit; a write-quorum failure, not
+// a missing object.
+var errCommitMetaMissing = StorageErr("commit metadata is missing")
+
 // errFileNotFound - cannot find requested file version.
 var errFileVersionNotFound = StorageErr("file version not found")
 

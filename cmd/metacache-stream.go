@@ -126,6 +126,9 @@ func (w *metacacheWriter) write(objs ...metaCacheEntry) error {
 		}
 	}
 	for _, o := range objs {
+		if o.listingSet != nil {
+			return errors.New("metacacheWriter: unresolved listing entry")
+		}
 		if len(o.name) == 0 {
 			return errors.New("metacacheWriter: no name provided")
 		}
@@ -170,6 +173,9 @@ func (w *metacacheWriter) stream() (chan<- metaCacheEntry, error) {
 	go func() {
 		defer w.streamWg.Done()
 		for o := range objs {
+			if o.listingSet != nil && w.streamErr == nil {
+				w.streamErr = errors.New("metacacheWriter: unresolved listing entry")
+			}
 			if len(o.name) == 0 || w.streamErr != nil {
 				continue
 			}

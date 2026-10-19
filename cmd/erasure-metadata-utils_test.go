@@ -20,6 +20,7 @@ package cmd
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -107,6 +108,96 @@ func TestReduceErrs(t *testing.T) {
 		if gotNewErr != errErasureWriteQuorum {
 			t.Errorf("Test %d : expected %s, got %s", i+1, errErasureWriteQuorum, gotErr)
 		}
+	}
+}
+
+// TestReduceWriteQuorumErrsCommitMetaMissing verifies that an in-quorum
+// errCommitMetaMissing reduces to the sentinel, which renameData() converts
+// to errErasureWriteQuorum, while below-quorum reduces directly to
+// errErasureWriteQuorum.
+func TestReduceWriteQuorumErrsCommitMetaMissing(t *testing.T) {
+	errs := make([]error, 16)
+	for i := range 9 {
+		errs[i] = errCommitMetaMissing
+	}
+	if err := reduceWriteQuorumErrs(t.Context(), errs, objectOpIgnoredErrs, 9); !errors.Is(err, errCommitMetaMissing) {
+		t.Errorf("expected %s, got %s", errCommitMetaMissing, err)
+	}
+	// The sentinel must be distinguishable from errFileNotFound so that
+	// commit failures are never mapped to ObjectNotFound (404).
+	if errors.Is(errCommitMetaMissing, errFileNotFound) {
+		t.Error("errCommitMetaMissing must not match errFileNotFound")
+	}
+
+	// Below quorum the reduction must yield a write-quorum failure (503);
+	// eight sentinels against eight committed drives is not a quorum.
+	belowQuorum := make([]error, 16)
+	for i := range 8 {
+		belowQuorum[i] = errCommitMetaMissing
+	}
+	if err := reduceWriteQuorumErrs(t.Context(), belowQuorum, objectOpIgnoredErrs, 9); !errors.Is(err, errErasureWriteQuorum) {
+		t.Errorf("expected %s, got %s", errErasureWriteQuorum, err)
+	}
+}
+
+// renameDataFailingDisk is a StorageAPI stub returning a fixed error
+// from RenameData, enough to drive renameData() in unit tests.
+type renameDataFailingDisk struct {
+	StorageAPI
+	err       error
+	undoWrite bool
+}
+
+func (d *renameDataFailingDisk) RenameData(context.Context, string, string, FileInfo, string, string, RenameOptions) (RenameDataResp, error) {
+	return RenameDataResp{}, d.err
+}
+
+func (d *renameDataFailingDisk) DeleteVersion(_ context.Context, _, _ string, _ FileInfo, _ bool, opts DeleteOptions) error {
+	d.undoWrite = opts.UndoWrite
+	return nil
+}
+
+// TestRenameDataCommitMetaMissing verifies that renameData() converts an
+// in-quorum errCommitMetaMissing into errErasureWriteQuorum (HTTP 503),
+// while an in-quorum errFileNotFound keeps its meaning so that
+// PutObject() still reports IncompleteBody for client disconnects.
+func TestRenameDataCommitMetaMissing(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failures int
+		diskErr  error
+		wantErr  error
+	}{
+		{"all_commit_metadata_missing", 16, errCommitMetaMissing, errErasureWriteQuorum},
+		{"quorum_commit_metadata_missing", 9, errCommitMetaMissing, errErasureWriteQuorum},
+		{"neither_side_has_quorum", 8, errCommitMetaMissing, errErasureWriteQuorum},
+		{"successful_write_quorum", 7, errCommitMetaMissing, nil},
+		{"staging_failure", 16, errFileNotFound, errFileNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metadata := make([]FileInfo, 16)
+			disks := make([]StorageAPI, 16)
+			for i := range disks {
+				metadata[i] = FileInfo{Deleted: true} // valid without erasure info
+				disk := &renameDataFailingDisk{}
+				if i < tc.failures {
+					disk.err = tc.diskErr
+				}
+				disks[i] = disk
+			}
+			_, _, _, err := renameData(t.Context(), disks, minioMetaTmpBucket, "tmp", metadata, "bucket", "object", 9)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("expected %v, got %v", tc.wantErr, err)
+			}
+			for i, disk := range disks {
+				// Failed writes undo only the drives that committed. A
+				// successful quorum must never be rolled back.
+				wantUndo := tc.wantErr != nil && i >= tc.failures
+				if got := disk.(*renameDataFailingDisk).undoWrite; got != wantUndo {
+					t.Errorf("disk %d: UndoWrite = %v, want %v", i, got, wantUndo)
+				}
+			}
+		})
 	}
 }
 

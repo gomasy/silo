@@ -191,19 +191,19 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 			return entries, err
 		}
 		entries.truncate(0)
-		go func() {
-			rpc := globalNotificationSys.restClientFromHash(pathJoin(o.Bucket, o.Prefix))
+		rpc := globalNotificationSys.restClientFromHash(pathJoin(o.Bucket, o.Prefix))
+		go func(o listPathOptions) {
 			if rpc != nil {
 				ctx, cancel := context.WithTimeout(GlobalContext, 5*time.Second)
 				defer cancel()
-				c, err := rpc.GetMetacacheListing(ctx, *o)
+				c, err := rpc.GetMetacacheListing(ctx, o)
 				if err == nil {
 					c.error = "no longer used"
 					c.status = scanStateError
 					rpc.UpdateMetacacheListing(ctx, *c)
 				}
 			}
-		}()
+		}(*o)
 		o.ID = ""
 	}
 
@@ -264,6 +264,176 @@ func (z *erasureServerPools) listPathShortcutEOF(ctx context.Context, bucket str
 	return io.EOF
 }
 
+// listingRLock covers the lock domains used by normal same-key mutations.
+// Multi-pool writes use the pools lock. In a single pool, DELETE/COPY use the
+// first set while PUT and metadata updates use the destination set, so recovery
+// takes both in that order. No writer routing or wire protocol changes here.
+func (z *erasureServerPools) listingRLock(ctx context.Context, bucket, object string, source *erasureObjects) (LockContext, func(), error) {
+	firstSet := z.serverPools[0].sets[0]
+	first := z.NewNSLock(bucket, object)
+	firstCtx, err := first.GetRLock(ctx, globalListingOperationTimeout)
+	if err != nil {
+		return LockContext{}, nil, err
+	}
+	if !z.SinglePool() || source == firstSet || (!source.nsMutex.isDistErasure && source.nsMutex == firstSet.nsMutex) {
+		return firstCtx, func() { first.RUnlock(firstCtx) }, nil
+	}
+	// Shared nsMutex pointers do not prove shared distributed locker sets.
+	second := source.NewNSLock(bucket, object)
+	secondCtx, err := second.GetRLock(firstCtx.Context(), globalListingOperationTimeout)
+	if err != nil {
+		first.RUnlock(firstCtx)
+		return LockContext{}, nil, err
+	}
+	return secondCtx, func() {
+		second.RUnlock(secondCtx)
+		first.RUnlock(firstCtx)
+	}, nil
+}
+
+// resolveListingGroup recovers a complete same-name group, never a private
+// per-set contribution. A strictly absent source requires current reads from
+// every pool, since another pool's earlier walk may predate a migration copy.
+func (z *erasureServerPools) resolveListingGroup(ctx context.Context, bucket string, group []*metaCacheEntry) (*metaCacheEntry, error) {
+	var source *erasureObjects
+	for _, entry := range group {
+		if entry.listingSet != nil {
+			source = entry.listingSet
+			break
+		}
+	}
+	if source == nil {
+		return nil, errInvalidArgument
+	}
+	// Recovery consumes this group. Return reusable walk buffers only after
+	// their contents have been copied into the newly encoded result.
+	defer func() {
+		for _, entry := range group {
+			if entry.reusable {
+				metaDataPoolPut(entry.metadata)
+			}
+		}
+	}()
+	name := group[0].name
+	object := encodeDirObject(name)
+	if z.SinglePool() {
+		target := z.serverPools[0].getHashedSet(object)
+		for _, entry := range group {
+			if entry.listingSet != nil && entry.listingSet != target {
+				// Unexpected placement is not evidence of absence at the
+				// current write target. Do not extend recovery to arbitrary sets.
+				return nil, listingReadQuorumError(bucket, object)
+			}
+		}
+	}
+	type readResult struct {
+		fi     FileInfo
+		absent bool
+	}
+	reads := make(map[*erasureObjects]readResult)
+	currentOnly := false
+	var current *FileInfo
+	err := func() error {
+		lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		lkctx, unlock, err := z.listingRLock(lockCtx, bucket, object, source)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		read := func(set *erasureObjects) (readResult, error) {
+			if result, ok := reads[set]; ok {
+				return result, nil
+			}
+			fi, absent, err := set.readListingFileInfo(lkctx.Context(), bucket, object)
+			result := readResult{fi: fi, absent: absent}
+			if err == nil {
+				reads[set] = result
+			}
+			return result, err
+		}
+		for _, entry := range group {
+			if entry.listingSet == nil {
+				continue
+			}
+			result, err := read(entry.listingSet)
+			if err != nil {
+				return err
+			}
+			currentOnly = currentOnly || result.absent
+		}
+		if !currentOnly {
+			return lkctx.Context().Err()
+		}
+		// Migration publishes the replacement through the pooled write lock
+		// before source cleanup. While this read lock is held, new publication
+		// cannot pass these reads; any concurrent cleanup already has a copy.
+		// Unknown pools still fail rather than being counted as absent.
+		for _, pool := range z.serverPools {
+			result, err := read(pool.getHashedSet(object))
+			if err != nil {
+				return err
+			}
+			if result.absent {
+				continue
+			}
+			// Match latest GET: newest ModTime, then lowest pool index.
+			if current == nil || result.fi.ModTime.After(current.ModTime) {
+				fi := result.fi
+				current = &fi
+			}
+		}
+		return lkctx.Context().Err()
+	}()
+	if err != nil {
+		return nil, err
+	}
+	// All FileInfo values above are owned decoded results. Encoding and merge
+	// allocation happen after RUnlock, as do all stream sends and cache RPCs.
+	encode := func(fi FileInfo) (*metaCacheEntry, error) {
+		xl := &xlMetaV2{}
+		if err := xl.AddVersion(fi); err != nil {
+			return nil, listingReadQuorumError(bucket, object)
+		}
+		entry := &metaCacheEntry{name: name, cached: xl, reusable: true}
+		var err error
+		entry.metadata, err = xl.AppendTo(metaDataPoolGet())
+		return entry, err
+	}
+	if currentOnly {
+		if current == nil {
+			return nil, nil
+		}
+		// Replace the whole group: no stale live copy or marker can override
+		// this current global decision.
+		return encode(*current)
+	}
+	versions := make([][]xlMetaV2ShallowVersion, 0, len(group))
+	for _, entry := range group {
+		if entry.listingSet != nil {
+			fi := reads[entry.listingSet].fi
+			xl := &xlMetaV2{}
+			if err := xl.AddVersion(fi); err != nil {
+				return nil, listingReadQuorumError(bucket, object)
+			}
+			versions = append(versions, xl.versions)
+			continue
+		}
+		xl, err := entry.xlmeta()
+		if err != nil {
+			return nil, listingReadQuorumError(bucket, object)
+		}
+		versions = append(versions, xl.versions)
+	}
+	// Preserve the existing cross-pool merge rule for recovered live metadata
+	// and delete markers when no source was strictly absent.
+	xl := &xlMetaV2{versions: mergeXLV2Versions(1, true, 0, versions...)}
+	// Do not retain shallow versions referencing reusable input buffers.
+	resolved := &metaCacheEntry{name: name, reusable: true}
+	resolved.metadata, err = xl.AppendTo(metaDataPoolGet())
+	return resolved, err
+}
+
 // listMerged will list across all sets and return a merged results stream.
 // The result channel is closed when no more results are expected.
 func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) error {
@@ -285,11 +455,14 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 				defer wg.Done()
 				err := set.listPath(listCtx, o, innerResults)
 				mu.Lock()
-				defer mu.Unlock()
 				if err == nil {
 					allAtEOF = false
 				}
 				errs[i] = err
+				mu.Unlock()
+				// The merger must observe the terminal error before treating
+				// this stream as exhausted and advancing to another pool.
+				xioutil.SafeClose(innerResults)
 			}(len(errs), set)
 			errs = append(errs, nil)
 		}
@@ -298,7 +471,18 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 
 	// Gather results to a single channel.
 	// Quorum is one since we are merging across sets.
-	err := mergeEntryChannels(ctx, inputs, results, 1)
+	err := mergeEntryChannelsWithResolver(ctx, inputs, results, 1, func(i int) error {
+		mu.Lock()
+		err := errs[i]
+		mu.Unlock()
+		// Keep the existing aggregate handling of absent paths and buckets.
+		if errors.Is(err, io.EOF) || isAllNotFound([]error{err}) {
+			return nil
+		}
+		return err
+	}, func(group []*metaCacheEntry) (*metaCacheEntry, error) {
+		return z.resolveListingGroup(ctx, o.Bucket, group)
+	})
 
 	cancelList()
 	wg.Wait()
@@ -415,13 +599,24 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 		cancel()
 	}()
 
-	// Do listing...
+	// Publish the typed terminal result before either consumer observes EOF.
+	// mergeEntryChannels closes inCh before listMerged has inspected set errors.
+	listingDone := make(chan struct{})
+	var cacheErrorDone chan struct{}
+	var listingErr error
 	go func(o listPathOptions) {
-		err := z.listMerged(listCtx, o, inCh)
-		if err != nil {
-			meta.setErr(err.Error())
+		listingErr = z.listMerged(listCtx, o, inCh)
+		failed := listingErr != nil && !errors.Is(listingErr, io.EOF)
+		if failed {
+			cacheErrorDone = make(chan struct{})
 		}
-		o.debugln("listAndSave: listing", o.ID, "finished with ", err)
+		close(listingDone)
+		if failed {
+			meta.setErr(listingErr.Error())
+			cancel()
+			close(cacheErrorDone)
+		}
+		o.debugln("listAndSave: listing", o.ID, "finished with ", listingErr)
 	}(*o)
 
 	// Keep track of when we return since we no longer have to send entries to output.
@@ -451,16 +646,33 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 			entry.reusable = returned
 			saveCh <- entry
 		}
+		// The typed scan result is enough to finish the HTTP response.
+		<-listingDone
 		if !returned {
 			xioutil.SafeClose(outCh)
+		}
+		// Closing saveCh writes an end-of-stream cache block. On failure,
+		// wait until the error is recorded and the writer is canceled.
+		if cacheErrorDone != nil {
+			<-cacheErrorDone
 		}
 		xioutil.SafeClose(saveCh)
 	}()
 
 	entries, err = filteredResults()
-	if err == nil {
-		// Check if listing recorded an error.
-		err = meta.getErr()
+	if err == nil || errors.Is(err, io.EOF) {
+		// Full pages may return before the scan ends. A final page has
+		// crossed the completion barrier above and must preserve scan errors.
+		select {
+		case <-listingDone:
+			if listingErr != nil && !errors.Is(listingErr, io.EOF) {
+				return entries, listingErr
+			}
+		default:
+		}
+		if cacheErr := meta.getErr(); cacheErr != nil {
+			return entries, cacheErr
+		}
 	}
 	return entries, err
 }
