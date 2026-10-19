@@ -152,6 +152,8 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 			if err = lookupDeprecatedScannerConfig(kvs, &cfg); err != nil {
 				return cfg, err
 			}
+			// Do not let the "default" speed below overwrite the deprecated values.
+			return cfg, nil
 		}
 	}
 
