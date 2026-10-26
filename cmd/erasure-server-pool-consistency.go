@@ -27,6 +27,7 @@ import (
 	madmin "github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	xhttp "github.com/minio/minio/internal/http"
+	"github.com/pgsty/silo-pkg/v3/sync/errgroup"
 )
 
 // objectPoolInfos reads the addressed version in every pool, including pools
@@ -532,4 +533,111 @@ func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket,
 	oi.Name = decodeDirObject(object)
 	oi.replicationDecision = opts.DeleteReplication.ReplicateDecisionStr
 	return oi, err
+}
+
+// deleteObjectsReconciled removes data while retaining each item's authoritative
+// copy until every other pool has completed its cleanup. The caller holds the
+// pools-layer write locks and separates marker creation from this batch.
+func (z *erasureServerPools) deleteObjectsReconciled(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
+	deleted := make([]DeletedObject, len(objects))
+	errs := make([]error, len(objects))
+	primary := make([]int, len(objects))
+	tiered := make([]bool, len(objects))
+	lookup := errgroup.WithNErrs(len(objects)).WithConcurrency(32)
+	for i, obj := range objects {
+		// Preserve the full request identity even if lookup or cleanup fails.
+		// The HTTP handler includes replication state in its response-index key.
+		deleted[i] = DeletedObject{
+			ObjectName:       obj.ObjectName,
+			VersionID:        obj.VersionID,
+			ReplicationState: obj.ReplicationState(),
+		}
+		primary[i] = -1
+		lookup.Go(func() error {
+			copies, err := z.objectPoolInfos(ctx, bucket, obj.ObjectName, ObjectOptions{VersionID: obj.VersionID, NoAuditLog: true})
+			if err == nil {
+				primary[i] = copies[0].Index
+				for _, copy := range copies {
+					tiered[i] = tiered[i] || copy.ObjInfo.TransitionedObject.Status == lifecycle.TransitionComplete
+				}
+			} else if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+				if isErrReadQuorum(err) {
+					err = InsufficientWriteQuorum{Bucket: bucket, Object: decodeDirObject(obj.ObjectName)}
+				}
+				errs[i] = err
+			}
+			return nil
+		}, i)
+	}
+	lookup.Wait()
+
+	type poolBatch struct {
+		objects []ObjectToDelete
+		indices []int
+		deleted []DeletedObject
+		errs    []error
+	}
+	for phase := 0; phase < 2; phase++ {
+		batches := make([]poolBatch, len(z.serverPools))
+		for i, obj := range objects {
+			if errs[i] != nil || tiered[i] {
+				continue
+			}
+			for p := range z.serverPools {
+				if (p == primary[i]) != (phase == 1) {
+					continue
+				}
+				batches[p].objects = append(batches[p].objects, obj)
+				batches[p].indices = append(batches[p].indices, i)
+			}
+		}
+		// Each phase still uses the set layer's bulk disk I/O and runs pools
+		// concurrently. Include apparently absent pools in cleanup: read-quorum
+		// absence is not proof that an offline drive holds no remaining copy.
+		group := errgroup.WithNErrs(len(z.serverPools))
+		for p, pool := range z.serverPools {
+			if len(batches[p].objects) == 0 {
+				continue
+			}
+			group.Go(func() error {
+				batches[p].deleted, batches[p].errs = pool.DeleteObjects(ctx, bucket, batches[p].objects, opts)
+				return nil
+			}, p)
+		}
+		group.Wait()
+		for _, batch := range batches {
+			for j, i := range batch.indices {
+				if errs[i] != nil {
+					continue
+				}
+				if batch.errs[j] != nil {
+					errs[i] = batch.errs[j]
+				} else if phase == 1 || primary[i] == -1 {
+					deleted[i] = batch.deleted[j]
+				}
+			}
+		}
+	}
+	// Tiered copies can share one remote object, including restored copies.
+	// Reuse the existing reconciliation which suppresses premature tier GC.
+	// Serializing this uncommon path also keeps duplicate key/version entries
+	// in one request from racing their metadata updates under the shared lock.
+	for i, obj := range objects {
+		if !tiered[i] || errs[i] != nil {
+			continue
+		}
+		deleteOpts := opts
+		deleteOpts.VersionID, deleteOpts.NoLock = obj.VersionID, true
+		deleteOpts.DeleteReplication = obj.ReplicationState()
+		if opts.PrefixEnabledFn != nil {
+			deleteOpts.Versioned = opts.PrefixEnabledFn(obj.ObjectName)
+		}
+		_, err := z.deleteObjectReconciled(ctx, bucket, obj.ObjectName, deleteOpts)
+		if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			errs[i] = err
+		} else {
+			deleted[i].found = true
+		}
+	}
+	return deleted, errs
 }
