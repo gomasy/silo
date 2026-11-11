@@ -24,7 +24,7 @@
 <p align="center">
   <a href="https://silo.pgsty.com/zh/"><img alt="官网" src="https://img.shields.io/badge/%E5%AE%98%E7%BD%91-silo.pgsty.com%2Fzh-1d588c"></a>
   <a href="https://github.com/pgsty/silo/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/pgsty/silo?include_prereleases&label=release&logo=github"></a>
-  <a href="https://hub.docker.com/r/pgsty/silo"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/pgsty/minio?logo=docker"></a>
+  <a href="https://hub.docker.com/r/pgsty/silo"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/pgsty/silo?logo=docker"></a>
   <a href="go.mod"><img alt="Go Version" src="https://img.shields.io/github/go-mod/go-version/pgsty/silo?logo=go"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPLv3-blue"></a>
 </p>
@@ -32,35 +32,25 @@
 > [!IMPORTANT]
 > **PGSTY Silo**（以下简称 Silo）是由 [Pigsty](https://pigsty.cc) 独立维护、从 [`pgsty/silo`](https://github.com/pgsty/silo) 发布的开源 MinIO 社区分支。本项目与 MinIO, Inc. 不存在隶属、背书或赞助关系；文中使用 “MinIO” 仅用于说明上游项目及兼容谱系。
 
-> [!NOTE]
-> 2026-08-06，本仓库由 `pgsty/minio` 更名为 `pgsty/silo`，默认分支由 `master` 更名为 `main`。以原 MinIO 形态维持的归档构件仍位于归档的 [`minio`](https://github.com/pgsty/silo/tree/minio) 分支，以及截止 [`RELEASE.2026-08-04T00-00-00Z`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z) 的历次发布中。
-
-## SILO 20261018000000
-
-[SILO 20261018000000](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z) 已正式发布，提供各平台归档包、Linux 软件包，以及 amd64／arm64 标准版和 distroless Docker 镜像。版本标签为 `RELEASE.2026-10-18T00-00-00Z`，包版本为 `20261018000000.0.0`。
-
-本版加强 Object Lock 与 IAM 鉴权，实现跨进程和站点的持久 STS 撤销，保护多池迁移中的并发更新，并改进 LIST 恢复、分片清理与 S3 错误处理。内置 Console v2.4.2、silo-pkg v3.14.3，使用 Go 1.27.2 构建，配套管理客户端为 mcli 20261018。
-
-升级前请阅读[发行说明](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-10-18T00-00-00Z)，特别是 strict 分片列表的移除、服务端协调升级要求与实测性能成本。代码、问题报告和文档贡献者见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
-
-20261026 维护版本正在准备中：使用 Go 1.27.3、silo-pkg v3.15.2、
-mcli 20261026、Console v2.5.1（`fff1618d9abb`）与上游 minio-go
-`320af050c445`。其中包含 Console **Reset to default（恢复默认）** 所需的
-Server IAM 缓存修复，以及远端回滚参数透传修复；保持既有存储超时与取消行为。
-请阅读[变更与仍存的存储限制](CHANGELOG.md#release2026-10-26t00-00-00z)；
-上述已发布制品仍保留原有组件版本。
-
 ## 概述
 
 上游停止社区发行后，Silo 为开源 MinIO 服务端维护一条持续可用的版本线：构建、软件包、多架构镜像、安全修复与完整 Web 控制台。Pigsty 在生产环境中用它承载 PostgreSQL 备份存储。
 
 它只遵循一条原则：**改名的是产品与交付物，不是协议与你的数据。** 其余内容都在 [silo.pgsty.com](https://silo.pgsty.com/zh/)。
 
-**相关项目：**[`pgsty/mc`](https://github.com/pgsty/mc) 客户端（以 `mcli` 发行） · [`pgsty/silo-console`](https://github.com/pgsty/silo-console) · [`pgsty/silo-pkg`](https://github.com/pgsty/silo-pkg) · [`pgsty/pigsty`](https://github.com/pgsty/pigsty)
+**相关项目：**[`pgsty/mc`](https://github.com/pgsty/mc) · [`pgsty/silo-console`](https://github.com/pgsty/silo-console) · [`pgsty/silo-pkg`](https://github.com/pgsty/silo-pkg) · [`pgsty/kes`](https://github.com/pgsty/kes) · [`pgsty/pigsty`](https://github.com/pgsty/pigsty)
 
 <p align="center">
   <img src="https://silo.pgsty.com/images/silo-console/console-metrics-simple.webp" alt="Silo 控制台">
 </p>
+
+#### SILO 20261109
+
+> [!WARNING]
+> [SILO 20261109](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-09T00-00-00Z) 修复了缺陷与安全漏洞，强烈建议尽快安排升级，以降低安全风险。
+
+> [!NOTE]
+> 2026-08-06，`pgsty/minio` 更名为 `pgsty/silo`，默认分支由 `master` 改为 `main`。最后一个 MinIO 品牌发布是 [`minio`](https://github.com/pgsty/silo/tree/minio) 分支上的 [`20260804`](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-08-04T00-00-00Z)。
 
 ## 快速上手
 
@@ -69,7 +59,7 @@ docker run -d --name silo -p 9000:9000 -p 9001:9001 \
   -e MINIO_ROOT_USER=minioadmin \
   -e MINIO_ROOT_PASSWORD=change-me-long-password \
   -v "$PWD/data:/data" \
-  docker.io/pgsty/silo:RELEASE.2026-10-18T00-00-00Z server /data --console-address ":9001"
+  docker.io/pgsty/silo:RELEASE.2026-11-09T00-00-00Z server /data --console-address ":9001"
 ```
 
 <p align="center">

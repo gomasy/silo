@@ -45,6 +45,35 @@ type iamGroupRevocation struct {
 // its revision so an older non-expiring credential cannot return.
 type iamExpireIdentity struct{}
 
+// An edit of an identity applies to the identity as it is stored now, under
+// its revision lock, not to a server's cached copy. A copy written back
+// whole would undo a rotation or an edit made meanwhile through this or
+// another server, whose notification this one may have missed, and bring
+// back an identity deleted meanwhile. edit receives the stored record and
+// changes it in place; it returns errIAMIdentityUnchanged to write nothing,
+// or any other error to refuse. An identity that is absent or deleted is
+// refused with errIAMIdentityGone.
+type iamIdentityEdit struct {
+	UserIdentity // the record written, or found unchanged
+	accessKey    string
+	edit         func(u *UserIdentity) error
+	unchanged    bool
+}
+
+// An identity create is checked against the record under the same revision
+// lock as the write. Local callers may recreate a deleted access key, but may
+// never replace a live stored service account that their cache did not contain.
+// Replicated creates retain the normal revision ordering below and may replace
+// an older live snapshot when their source revision wins.
+type iamIdentityCreate struct {
+	UserIdentity
+}
+
+var (
+	errIAMIdentityGone      = errors.New("IAM identity is absent or deleted in storage")
+	errIAMIdentityUnchanged = errors.New("IAM identity edit changes nothing")
+)
+
 // The authoritative revocation is durable even if dependent cleanup fails.
 // Callers must publish it to sibling caches before returning the error.
 type iamCommittedCleanupError struct {
@@ -251,6 +280,69 @@ func saveIAMRevision(ctx context.Context, store IAMStorageAPI, path string, item
 	previous, err := loadIAMRevision(ctx, store, path)
 	if err != nil {
 		return err
+	}
+	if op, ok := item.(*iamIdentityCreate); ok {
+		if _, replicated := iamReplicationTime(ctx); !replicated {
+			var current UserIdentity
+			err := store.loadIAMConfig(ctx, &current, path)
+			switch {
+			case err == nil && !current.Deleted:
+				return fmt.Errorf("%w: access key already exists in storage", errIAMServiceAccountNotAllowed)
+			case err == nil, errors.Is(err, errConfigNotFound):
+				// A tombstone or an absent record can be recreated. The
+				// existing revision path below retains its revocation boundary.
+			default:
+				return err
+			}
+		}
+		item = &op.UserIdentity
+	}
+	if op, ok := item.(*iamIdentityEdit); ok {
+		var current UserIdentity
+		err := store.loadIAMConfig(ctx, &current, path)
+		if errors.Is(err, errConfigNotFound) {
+			return errIAMIdentityGone
+		}
+		if err != nil {
+			return err
+		}
+		if current.Deleted {
+			if origin, replicated := iamReplicationTime(ctx); replicated && !origin.After(previous.timestamp()) {
+				// A peer's edit from before this deletion: acknowledged.
+				return errIAMStaleUpdate
+			}
+			return errIAMIdentityGone
+		}
+		// Normalize the record as the identity loaders do: the path names the
+		// access key, the claims are the token's, and a deprecated comment
+		// stands in for an empty description.
+		if current.Credentials.AccessKey == "" {
+			current.Credentials.AccessKey = op.accessKey
+		}
+		if current.Credentials.SessionToken != "" {
+			claims, err := extractJWTClaims(current)
+			if err != nil {
+				return err
+			}
+			current.Credentials.Claims = claims.Map()
+		}
+		if current.Credentials.Description == "" {
+			current.Credentials.Description = current.Credentials.Comment
+		}
+		if err := op.edit(&current); err != nil {
+			if errors.Is(err, errIAMIdentityUnchanged) {
+				op.UserIdentity, op.unchanged = current, true
+				return nil
+			}
+			return err
+		}
+		current.UpdatedAt = time.Time{} // a new revision, as for any local edit
+		op.UserIdentity = current
+		item = &op.UserIdentity
+		if strings.HasPrefix(path, iamConfigSTSPrefix) {
+			// Keep the record expiring with its token, as SetTempUser stores it.
+			opts = []options{{ttl: max(1, int64(time.Until(current.Credentials.Expiration).Seconds()))}}
+		}
 	}
 	if _, expiring := item.(*iamExpireIdentity); expiring {
 		sts := strings.HasPrefix(path, iamConfigSTSPrefix)

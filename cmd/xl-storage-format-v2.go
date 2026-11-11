@@ -878,7 +878,9 @@ func isIndexedMetaV2(buf []byte) (meta xlMetaBuf, data xlMetaInlineData, err err
 		// Read metadata CRC
 		buf = nbuf
 		if got := uint32(xxhash.Sum64(meta)); got != crc {
-			return nil, nil, fmt.Errorf("xlMetaV2.Load version(%d), CRC mismatch, want 0x%x, got 0x%x", minor, crc, got)
+			// Use the storage sentinel so corruption retains its classification
+			// across both local storage and storage RPC.
+			return nil, nil, errFileCorrupt
 		}
 	} else {
 		return nil, nil, err
@@ -1054,7 +1056,7 @@ func (x *xlMetaV2) loadLegacy(buf []byte) error {
 					// Read metadata CRC (added in v2)
 					buf = nbuf
 					if got := uint32(xxhash.Sum64(v)); got != crc {
-						return fmt.Errorf("xlMetaV2.Load version(%d), CRC mismatch, want 0x%x, got 0x%x", minor, crc, got)
+						return errFileCorrupt
 					}
 				} else {
 					return fmt.Errorf("xlMetaV2.Load version(%d), loading CRC: %w", minor, err)
@@ -1136,6 +1138,17 @@ func (x *xlMetaV2) latestModtime() time.Time {
 		return time.Time{}
 	}
 	return time.Unix(0, x.versions[0].header.ModTime)
+}
+
+// isLatestDeleteMarker returns true if the latest version that is not a free
+// version is a delete marker, or if there is none.
+func (x *xlMetaV2) isLatestDeleteMarker() bool {
+	for _, ver := range x.versions {
+		if !ver.header.FreeVersion() {
+			return ver.header.Type == DeleteType
+		}
+	}
+	return true
 }
 
 func (x *xlMetaV2) addVersion(ver xlMetaV2Version) error {
@@ -1361,6 +1374,39 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 		}
 	}
 
+	if fi.TierFreeVersion() {
+		_, ver, err := x.findVersion(uv)
+		if err != nil {
+			return "", err
+		}
+		if ver.Type != DeleteType || !ver.DeleteMarker.FreeVersion() ||
+			string(ver.DeleteMarker.MetaSys[metaTierName]) != fi.TransitionTier ||
+			string(ver.DeleteMarker.MetaSys[metaTierObjName]) != fi.TransitionedObjName ||
+			string(ver.DeleteMarker.MetaSys[metaTierVersionID]) != fi.TransitionVersionID {
+			return "", errFileVersionNotFound
+		}
+	}
+
+	if fi.ExpireRestored {
+		i, ver, err := x.findVersion(uv)
+		if err != nil {
+			return "", err
+		}
+		// Check the stored type and transition before any marker, legacy or
+		// replication mutation. Only completed tiered objects own a cache.
+		if ver.Type != ObjectType || string(ver.ObjectV2.MetaSys[metaTierStatus]) != lifecycle.TransitionComplete {
+			return "", nil
+		}
+		ver.ObjectV2.RemoveRestoreHdrs()
+		if err := x.setIdx(i, *ver); err != nil {
+			return "", err
+		}
+		if x.SharedDataDirCount(ver.ObjectV2.VersionID, ver.ObjectV2.DataDir) > 0 {
+			return "", nil
+		}
+		return uuid.UUID(ver.ObjectV2.DataDir).String(), nil
+	}
+
 	var ventry xlMetaV2Version
 	if fi.Deleted {
 		ventry = xlMetaV2Version{
@@ -1485,11 +1531,8 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		switch {
-		case fi.ExpireRestored:
-			ver.ObjectV2.RemoveRestoreHdrs()
-			err = x.setIdx(i, *ver)
-		case fi.TransitionStatus == lifecycle.TransitionComplete:
+		switch fi.TransitionStatus {
+		case lifecycle.TransitionComplete:
 			ver.ObjectV2.SetTransition(fi)
 			ver.ObjectV2.ResetInlineData()
 			err = x.setIdx(i, *ver)
@@ -2027,9 +2070,11 @@ func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions 
 				if !checkedSingleNull {
 					singleNull = singleNullVersionStreams(originalVersions, false)
 					// Availability-optimized writes can change EC while a drive
-					// is offline. Only latest-only non-strict reads may recount
-					// these ordinary null versions across separate modern EC groups.
-					mixedECNull = !singleNull && !strict && requestedVersions == 1 &&
+					// is offline. Only non-strict reads may recount these
+					// ordinary null versions across separate modern EC groups.
+					// Each stream holds just this version, so listing all
+					// versions (decommission, rebalance) must recount too.
+					mixedECNull = !singleNull && !strict &&
 						singleNullVersionStreams(originalVersions, true)
 					checkedSingleNull = true
 				}
@@ -2289,6 +2334,7 @@ func (x xlMetaBuf) ListVersions(volume, path string, allParts bool) ([]FileInfo,
 }
 
 // IsLatestDeleteMarker returns true if latest version is a deletemarker or there are no versions.
+// Free versions are not versions of the object and are skipped.
 // If any error occurs false is returned.
 func (x xlMetaBuf) IsLatestDeleteMarker() bool {
 	vers, headerV, _, buf, err := decodeXLHeaders(x)
@@ -2298,12 +2344,16 @@ func (x xlMetaBuf) IsLatestDeleteMarker() bool {
 	if vers == 0 {
 		return true
 	}
-	isDeleteMarker := false
+	isDeleteMarker := true // only free versions
 
 	_ = decodeVersions(buf, vers, func(idx int, hdr, _ []byte) error {
 		var xl xlMetaV2VersionHeader
 		if _, err := xl.unmarshalV(headerV, hdr); err != nil {
+			isDeleteMarker = false
 			return errDoneForNow
+		}
+		if xl.FreeVersion() {
+			return nil
 		}
 		isDeleteMarker = xl.Type == DeleteType
 		return errDoneForNow
@@ -2312,7 +2362,7 @@ func (x xlMetaBuf) IsLatestDeleteMarker() bool {
 }
 
 // AllHidden returns true are no versions that would show up in a listing (ie all free markers)
-// Optionally also return early if top is a delete marker.
+// Optionally also return early if the top version that is not free is a delete marker.
 func (x xlMetaBuf) AllHidden(topDeleteMarker bool) bool {
 	vers, headerV, _, buf, err := decodeXLHeaders(x)
 	if err != nil {
@@ -2328,16 +2378,12 @@ func (x xlMetaBuf) AllHidden(topDeleteMarker bool) bool {
 		if _, err := xl.unmarshalV(headerV, hdr); err != nil {
 			return errDoneForNow
 		}
-		if topDeleteMarker && idx == 0 && xl.Type == DeleteType {
-			hidden = true
-			return errDoneForNow
+		if xl.FreeVersion() {
+			// Check next version
+			return nil
 		}
-		if !xl.FreeVersion() {
-			hidden = false
-			return errDoneForNow
-		}
-		// Check next version
-		return nil
+		hidden = topDeleteMarker && xl.Type == DeleteType
+		return errDoneForNow
 	})
 	return hidden
 }
