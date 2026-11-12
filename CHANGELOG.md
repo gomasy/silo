@@ -1,12 +1,194 @@
 # Changelog
 
+## RELEASE.2026-11-12T00-00-00Z
+
+Package version: `20261112000000.0.0`. Publication status and artifacts are
+listed in [GitHub Releases](https://github.com/pgsty/silo/releases). This
+section covers the changes after the published 20261109 source `d998292387cc`,
+adopting Go `1.27.4`, `silo-pkg v3.16.1`, embedded Console `v2.7.2`, and
+bundled `mcli 20261112`. See the
+[server compatibility notes](https://silo.pgsty.com/compatibility/server/)
+for behavior and upgrade boundaries.
+
+- Release checks verify the selected pkg and embedded Console versions and
+  match the bundled mcli release to its source module, independently of local
+  workspaces, before building release artifacts. Deploy SILO and mcli
+  `RELEASE.2026-11-12T00-00-00Z` by default from Helm chart `7.0.5`.
+- Replica writes and copies use the destination version's retention, legal
+  hold and tags under its mutation lock, verify staged replica content and
+  SSE-C/compressed metadata against stored locked versions before committing,
+  and prevent newer peer timestamps from weakening unexpired COMPLIANCE
+  retention. Cross-pool reconciliation preserves COMPLIANCE protection
+  regardless of pool order, while authorized changes to GOVERNANCE retention
+  and legal hold remain possible. Local lock revisions advance past stored
+  revisions, unaddressed deletes under versioning suspension or excluded
+  prefixes enforce Object Lock across single-pool and multi-pool deployments
+  and fail closed when versioning or Object Lock metadata cannot be read,
+  bucket metadata imports require versioning across prefix exclusions as well
+  as suspension, and peer replication-trust headers must be signed with
+  header-based SigV4 ([#336](https://github.com/pgsty/silo/issues/336)).
+- Tagging proxies (`GET`, `PUT` and `DELETE`) authenticate and authorize every
+  present replica, including its stored tags, fail closed on unreadable targets,
+  and skip missing replicas caused by replication lag unless all targets are
+  absent; active-active `GET` and `HEAD` proxies enforce `s3:ExistingObjectTag`
+  and `s3:versionid` before returning peer responses, forward
+  `X-Amz-Tagging-Directive: ACCESS` on `HEAD`, gate proxied
+  `x-amz-tagging-count` and `X-Amz-Tagging` headers on tag-read authorization
+  without emitting duplicate headers, and filter canonical-case peer
+  `X-Amz-Object-Lock-*` headers when `s3:GetObjectRetention` or
+  `s3:GetObjectLegalHold` is denied. Authenticated unsigned-trailer
+  uploads enforce the request time window and header signatures, SigV4 header,
+  presigned, streaming and POST policy verifiers bind the credential-scope date
+  to the signed request timestamp, streaming trailer readers bound trailer memory
+  and surface non-EOF stream errors without hanging on negative
+  `X-Amz-Decoded-Content-Length`, and bucket metadata cache loads no longer
+  overwrite fresher concurrent updates
+  ([#337](https://github.com/pgsty/silo/issues/337),
+  [#338](https://github.com/pgsty/silo/issues/338)).
+- Object tag and version authorization now applies consistently across read,
+  copy, list and archive endpoints: `GetObject`, `HeadObject` and
+  `SelectObjectContent` evaluate `s3:ExistingObjectTag` and `s3:versionid`
+  (preserving retryable `5xx` server errors for callers authorized by tag
+  conditions when storage is unreadable, resolving the 20261109 limitation in
+  [#293](https://github.com/pgsty/silo/issues/293) via
+  [PR #294](https://github.com/pgsty/silo/pull/294)); `CopyObject` and
+  `UploadPartCopy` authorize source `s3:ExistingObjectTag` and `s3:versionid`
+  as well as destination `s3:RequestObjectTag` on copied tags; both
+  `x-amz-tagging-count` and `X-Amz-Tagging` (`X-Amz-Tagging-Directive: ACCESS`)
+  are omitted on `GET`/`HEAD` (including versioned reads, STS sessions,
+  presigned/anonymous requests and replication proxies) unless
+  `s3:GetObjectTagging` / `s3:GetObjectVersionTagging` (with no explicit `Deny`)
+  or signed `s3:ReplicateTags` permits; `ListObjectsV2` / `ListObjectVersions` with `metadata=true` evaluate
+  current-object and per-version metadata permissions respectively, using stored tags; and `GetObjectAttributes`,
+  tagging handlers (`GET`/`PUT`/`DELETE`) and ZIP `GET`/`HEAD`/member listings
+  authorize stored tags and version actions without mutating unindexed archives
+  ([#342](https://github.com/pgsty/silo/issues/342)).
+- Policy parsing rejects unknown JSON fields, trailing tokens and malformed
+  principals across admin IAM policy/user/service-account endpoints, STS
+  session policies, IAM imports/replication, bucket policies and bucket metadata
+  imports instead of silently accepting empty or wildcard fallbacks. Validate
+  the complete imported policy file before applying entries; retain supported
+  historical snapshot semantics and explicit null bucket-policy replication
+  tombstones. New session policies retain strict resource validation.
+- Every explicit version removal in S3 `DeleteObjects`, including in buckets
+  without Object Lock, now uses the sequential single-object path to check
+  metadata, retention and replication under the mutation lock. Large version
+  purges can take longer. Unaddressed deletes that can replace a locked null
+  version also use the single-object path; other unaddressed deletes retain
+  bulk execution.
+- Decommission rescans keys hidden below another key only while source
+  versions are actually removed, resolving the 20261109 limitation recorded
+  in [#334](https://github.com/pgsty/silo/issues/334)
+  ([PR #335](https://github.com/pgsty/silo/pull/335)). Decommission and rebalance
+  clean up successfully migrated sibling versions after concurrent deletion
+  of another version. Source-removal and final empty verification check every
+  online drive and tolerate offline drives within the erasure set's read quorum,
+  while rejecting online metadata remnants, corrupt metadata, directory errors
+  and drive outages beyond parity. Cancellation returns an error, and a scan
+  without physical progress stops. Free-version tier ownership and the final
+  physical-empty check remain protected
+  ([#340](https://github.com/pgsty/silo/issues/340)). See the
+  [decommission procedure](https://silo.pgsty.com/operations/deployments/baremetal-decommission-server-pool/).
+- Site-replication bucket healing, metadata healing, status collection and
+  replication hooks snapshot site topology and release the state read lock
+  before storage I/O and peer RPCs, avoiding deadlocks and state-map races
+  when a configuration writer is waiting
+  ([#341](https://github.com/pgsty/silo/issues/341)). IAM import preserves
+  disabled service accounts and groups, reports group failures, and excludes
+  derived session-policy claims from exported and replicated credentials
+  ([#345](https://github.com/pgsty/silo/issues/345)).
+- Lifecycle history revision counting treats old and healed `xl.meta` headers
+  for the same version as one revision ([#332](https://github.com/pgsty/silo/issues/332)),
+  and restore expiry no longer turns a time-derived data-directory flag into a
+  different version revision; mixed healed headers can reach quorum and expired
+  local restore data can be cleaned up ([#344](https://github.com/pgsty/silo/issues/344)).
+  Historical-version self-copy plans its destination pool and data rewrite
+  before encryption or compression, preserving multi-block compression seek
+  indexes so a source version in another pool creates a readable new version.
+  In-place metadata updates locate the exact requested version and preserve
+  authoritative content on moving pools, while copies that require encryption
+  or checksum recomputation select an active pool
+  ([#343](https://github.com/pgsty/silo/issues/343)). Indexed `Range` reads into
+  compressed, server-side encrypted (`SSE-S3`, `SSE-KMS`, `SSE-C`) objects also
+  succeed when the target compressed block starts inside the first 64 KiB
+  encrypted frame (`decryptSkip > 0`), without rewriting stored objects.
+- Batch KMS rotation decodes and validates the configured encryption context
+  as strict UTF-8 JSON before changing an object key and without adding
+  validation-probe fields to object metadata, supports `SSE-S3` to `SSE-KMS`
+  key migration and multipart metadata preservation, and rewrites legacy `XLV1`
+  objects onto `XLv2` streams instead of failing in-place metadata updates
+  ([#346](https://github.com/pgsty/silo/issues/346)). Incoming HTTP
+  `X-Amz-Server-Side-Encryption-Context` headers on `PutObject`, `CopyObject`,
+  `CreateMultipartUpload` and browser `POST` uploads reject empty values,
+  malformed Base64/UTF-8/JSON, trailing tokens and non-string/non-`null` member
+  values with `400 InvalidArgument` instead of `500 InternalError`. Batch variable
+  preflight follows the pinned policy evaluator's literal and substitution
+  rules, including BinaryEquals, while retaining refusal of unavailable
+  request context. This does not add AWS special-variable escape semantics
+  ([#347](https://github.com/pgsty/silo/issues/347)).
+- Service-account and access-key create/edit normalize a missing policy Version
+  to `2012-10-17`, reject malformed or unknown policy fields, and distinguish an
+  omitted or `null` policy (preserve existing inline policy) from an explicit
+  empty policy document such as `{}` or `{"Statement":[]}` (reset to parent
+  inheritance), while keeping historical deny-all accounts carrying an empty
+  embedded policy restricted until explicitly reset
+  ([#339](https://github.com/pgsty/silo/issues/339),
+  [Console #89](https://github.com/pgsty/silo-console/issues/89),
+  [mcli #78](https://github.com/pgsty/mc/issues/78)). Previously,
+  `mcli admin user svcacct disable`, `enable` and `edit` without `--policy`,
+  the matching `admin accesskey` and `idp ldap/openid accesskey` commands, and
+  any other `update-service-account` request without `newPolicy` removed the
+  inline policy on the receiving site and on site-replication peers for
+  non-root parent users. In the matching Console (`v2.7.2`), turn off **Restrict
+  beyond user policy** or enter `{}` to remove an inline policy; clearing the
+  editor while restriction is enabled prevents saving, save errors render inside
+  the edit modal, and HTTP-to-HTTPS browser redirects preserve the request host
+  or `CONSOLE_SECURE_TLS_HOST` when bound to `--host 0.0.0.0`
+  (`unrolled/secure v1.18.0`). Freeze service-account edits on un-upgraded
+  `20261109` nodes during rollout; after upgrading every site, review accounts
+  that `svcacct info` reports with `Policy: implied` and re-apply restrictions
+  where needed.
+
+- S3 `DeleteObjects` on a single pool stops at an entry whose name fails the
+  object name check: the entry returns `XMinioInvalidObjectName` and is not
+  locked or sent to a drive, as with a single-object DELETE and with more than
+  one pool. Until now such an entry still reached the drives of the node, where
+  a name with a `..` segment was joined to the request bucket. A caller allowed
+  to delete in one bucket could remove a version in another bucket, including
+  one under Object Lock retention, and from a versioned bucket could put a
+  delete marker on an object of another bucket or on stored system metadata
+  such as a bucket's configuration. The other entries of a request are deleted
+  as before.
+
+- Site replication sends a service account or access key as the record its
+  site has stored, whole: for a create, for every edit, at the first sync of a
+  new site and when healing. IAM export writes that record too. Until now an
+  edit was sent as the fields it changed. A peer that an earlier edit had not
+  reached, or reached late, kept the old secret key, status or inline policy
+  under the revision of the later edit, and healing took the sites for equal:
+  a key that was rotated, disabled or restricted on one site stayed as it was
+  on the other. Sync, heal and export took the claims and the inline policy, and
+  heal the secret key and status as well, from the cache of the server that ran
+  them, which can predate an edit made through another server of the site, and
+  sent them under the revision of the stored record. A service account created
+  for a user that had been deleted and created again did not reach the peers
+  before healing. Peers on 20261109 and 20261026 apply the new items as they
+  apply a healed account, and an edit that names no policy no longer removes the
+  inline policy on such a peer; a site that is not upgraded still sends its own
+  edits the old way. An edit now gives every site the whole account of the site
+  that took it, so accounts that already differ between sites are not repaired
+  by the upgrade, but by the next edit: after upgrading every site, review such
+  accounts and edit each one at a site that has it right.
+
 ## RELEASE.2026-11-09T00-00-00Z
 
-Package version: `20261109000000.0.0`. Publication status and artifacts are
-listed in [GitHub Releases](https://github.com/pgsty/silo/releases). This
-section covers the changes after the published 20261026 source `c3ad836aed0d`.
-Most fixes come from reports and patches by
-[@botdeniska](https://github.com/botdeniska); see [CONTRIBUTORS.md](CONTRIBUTORS.md).
+Package version: `20261109000000.0.0`; published from source `d998292387cc`.
+Artifacts are listed in the [GitHub release](https://github.com/pgsty/silo/releases/tag/RELEASE.2026-11-09T00-00-00Z).
+The coordinated [English release notes](https://silo.pgsty.com/blog/release/silo-20261109/)
+and [Chinese release notes](https://silo.pgsty.com/zh/blog/release/silo-20261109/)
+cover all components, upgrade guidance, and validation scope since the
+published 20261026 source `c3ad836aed0d`. Most fixes come from reports and
+patches by [@botdeniska](https://github.com/botdeniska); see [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 Lifecycle, multi-pool and tiering:
 
@@ -21,7 +203,8 @@ Lifecycle, multi-pool and tiering:
   `retainVersions: 0`) on the expired key instead of the keys below it; a key
   with a tiered or Object Lock protected version is refused
   ([#297](https://github.com/pgsty/silo/issues/297)).
-- Stop taking the free version of a deleted tiered version for a version
+- Exclude the internal free-version marker of a deleted tiered version from
+  visible version history and lifecycle decisions
   ([#263](https://github.com/pgsty/silo/issues/263)), apply rules whose only
   action is `DelMarkerExpiration` ([#268](https://github.com/pgsty/silo/issues/268)),
   and report and account only the removals that happened
@@ -167,7 +350,7 @@ Known issues: `ListMultipartUploads` prefix and paging
 ([#217](https://github.com/pgsty/silo/issues/217)), replayed bucket creation
 under site replication ([PR #241](https://github.com/pgsty/silo/pull/241)), and
 `403` instead of the server error for reads allowed only by object tags while
-the object is unreadable ([#293](https://github.com/pgsty/silo/issues/293)).
+the object is unreadable ([PR #294](https://github.com/pgsty/silo/pull/294)).
 
 ## RELEASE.2026-10-26T00-00-00Z
 

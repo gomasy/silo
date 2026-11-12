@@ -28,10 +28,26 @@ import (
 	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/auth"
 	objectlock "github.com/minio/minio/internal/bucket/object/lock"
+	"github.com/minio/minio/internal/bucket/versioning"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/pgsty/silo-pkg/v3/policy"
 )
+
+// checkBucketDeleteMetadata loads bucket versioning and Object Lock configs
+// fail-closed so delete handlers never fall back to unversioned/unlocked
+// defaults when bucket metadata cannot be read.
+func checkBucketDeleteMetadata(bucketName string) (*versioning.Versioning, objectlock.Retention, error) {
+	vc, err := globalBucketVersioningSys.Get(bucketName)
+	if err != nil {
+		return nil, objectlock.Retention{}, err
+	}
+	rcfg, err := globalBucketObjectLockSys.Get(bucketName)
+	if err != nil {
+		return nil, objectlock.Retention{}, err
+	}
+	return vc, rcfg, nil
+}
 
 // BucketObjectLockSys - map of bucket and retention configuration.
 type BucketObjectLockSys struct{}
@@ -354,6 +370,8 @@ func checkPutObjectLockAllowed(ctx context.Context, rq *http.Request, bucket, ob
 	var legalHold objectlock.ObjectLegalHold
 
 	retentionRequested := objectlock.IsObjectLockRetentionRequested(rq.Header)
+	// A timestamp without a value is a replicated retention removal.
+	retentionRequested = retentionRequested || replicaTrusted && rq.Header.Get(xhttp.MinIOSourceObjectRetentionTimestamp) != ""
 	legalHoldRequested := objectlock.IsObjectLockLegalHoldRequested(rq.Header)
 
 	retentionCfg, err := globalBucketObjectLockSys.Get(bucket)
@@ -472,6 +490,103 @@ func storedObjectLockState(metadata map[string]string) objectLockState {
 	}
 }
 
+// reducePoolLockState selects each field independently using a total order,
+// so neither pool enumeration nor the starting copy can change the result.
+// Active COMPLIANCE takes precedence over revisions; among those copies the
+// longest retention wins. Only expired COMPLIANCE may lose to a removal.
+func reducePoolLockState(copies []PoolObjInfo, readState func(map[string]string) objectLockState) objectLockState {
+	var now time.Time
+	clockRead := false
+	state := readState(copies[0].ObjInfo.UserDefined)
+	for _, copy := range copies[1:] {
+		next := readState(copy.ObjInfo.UserDefined)
+		if !clockRead && (state.mode == string(objectlock.RetCompliance) || next.mode == string(objectlock.RetCompliance)) {
+			var err error
+			now, err = objectlock.UTCNowNTP()
+			if err != nil {
+				now = time.Time{} // An unavailable clock cannot prove retention expired.
+			}
+			clockRead = true
+		}
+		if comparePoolRetention(next, state, now) > 0 {
+			state.mode, state.retainUntil, state.retentionTimestamp = next.mode, next.retainUntil, next.retentionTimestamp
+		}
+		order := compareLockRevision(next.legalHoldTimestamp, state.legalHoldTimestamp)
+		// Equal or unordered conflicting holds resolve to ON, then OFF, then
+		// absence. A strictly newer valid OFF still releases a prior hold.
+		if order == 0 {
+			order = strings.Compare(next.legalHold, state.legalHold)
+		}
+		if order == 0 {
+			order = strings.Compare(next.legalHoldTimestamp, state.legalHoldTimestamp)
+		}
+		if order > 0 {
+			state.legalHold, state.legalHoldTimestamp = next.legalHold, next.legalHoldTimestamp
+		}
+	}
+	return state
+}
+
+func compareLockRevision(a, b string) int {
+	ta, aok := lockRevisionTime(a)
+	tb, bok := lockRevisionTime(b)
+	if aok != bok {
+		if aok {
+			return 1
+		}
+		return -1
+	}
+	if !aok {
+		return 0
+	}
+	return ta.Compare(tb)
+}
+
+func comparePoolRetention(a, b objectLockState, now time.Time) int {
+	au, ae := time.Parse(time.RFC3339Nano, a.retainUntil)
+	bu, be := time.Parse(time.RFC3339Nano, b.retainUntil)
+	ap := a.mode == string(objectlock.RetCompliance) && (ae != nil || now.IsZero() || au.After(now))
+	bp := b.mode == string(objectlock.RetCompliance) && (be != nil || now.IsZero() || bu.After(now))
+	if ap != bp {
+		if ap {
+			return 1
+		}
+		return -1
+	}
+	if ap { // An unreadable COMPLIANCE deadline cannot be shortened either.
+		if (ae != nil) != (be != nil) {
+			if ae != nil {
+				return 1
+			}
+			return -1
+		}
+		if ae == nil && au.Compare(bu) != 0 {
+			return au.Compare(bu)
+		}
+	}
+	if order := compareLockRevision(a.retentionTimestamp, b.retentionTimestamp); order != 0 {
+		return order
+	}
+	// Ties and legacy unordered metadata must also have a stable winner.
+	// A retained value takes precedence over an unordered absence.
+	if order := strings.Compare(a.mode, b.mode); order != 0 {
+		return order
+	}
+	if (ae != nil) != (be != nil) {
+		if ae != nil {
+			return 1
+		}
+		return -1
+	}
+	if ae == nil && be == nil && au.Compare(bu) != 0 {
+		return au.Compare(bu)
+	}
+	if order := strings.Compare(a.retainUntil, b.retainUntil); order != 0 {
+		return order
+	}
+	return strings.Compare(a.retentionTimestamp, b.retentionTimestamp)
+}
+
 // olderThan reports whether a stored replication timestamp is missing,
 // unreadable, or earlier than the source timestamp, in which case the
 // replica update wins. A zero source timestamp never wins.
@@ -489,6 +604,25 @@ func (s objectLockState) retentionIsOlderThan(src time.Time) bool {
 
 func (s objectLockState) legalHoldIsOlderThan(src time.Time) bool {
 	return olderThan(s.legalHoldTimestamp, src)
+}
+
+// A peer's ordering timestamp cannot override an unexpired COMPLIANCE lock.
+// Otherwise it could first remove retention with a same-content retransmit,
+// then replace the now-unprotected version in a second request.
+func (s objectLockState) complianceWouldWeaken(incoming objectLockState) bool {
+	if s.mode != string(objectlock.RetCompliance) {
+		return false
+	}
+	until, err := time.Parse(time.RFC3339Nano, s.retainUntil)
+	if err != nil {
+		return true
+	}
+	now, err := objectlock.UTCNowNTP()
+	if err == nil && !until.After(now) {
+		return false
+	}
+	nextUntil, nextErr := time.Parse(time.RFC3339Nano, incoming.retainUntil)
+	return incoming.mode != string(objectlock.RetCompliance) || nextErr != nil || nextUntil.Before(until)
 }
 
 // restoreRetention and restoreLegalHold put the stored state back into
@@ -524,14 +658,20 @@ func (s objectLockState) restoreLegalHold(metadata map[string]string) {
 // (an older incoming value must not win over a newer stored one just because the
 // read timed out).
 func replicaStoredLock(ctx context.Context, getObjectInfo GetObjectInfoFn, bucket, object, versionID string) (objectLockState, error) {
-	oi, err := getObjectInfo(ctx, bucket, object, ObjectOptions{VersionID: versionID})
+	oi, err := replicaStoredObjectInfo(ctx, getObjectInfo, bucket, object, versionID)
+	return storedObjectLockState(oi.UserDefined), err
+}
+
+// The same destination lookup supplies both Object Lock and tag revisions.
+func replicaStoredObjectInfo(ctx context.Context, getObjectInfo GetObjectInfoFn, bucket, object, versionID string) (ObjectInfo, error) {
+	oi, err := getObjectInfo(ctx, bucket, object, ObjectOptions{VersionID: versionID, ReplicationRequest: true})
 	switch {
 	case err == nil:
-		return storedObjectLockState(oi.UserDefined), nil
+		return oi, nil
 	case isErrObjectNotFound(err) || isErrVersionNotFound(err):
-		return objectLockState{}, nil
+		return ObjectInfo{}, nil
 	default:
-		return objectLockState{}, err
+		return ObjectInfo{}, err
 	}
 }
 
@@ -610,7 +750,7 @@ func reconcileStoredObjectLock(metadata map[string]string, stored objectLockStat
 	incoming := storedObjectLockState(metadata)
 
 	incomingRetentionTS, _ := time.Parse(time.RFC3339Nano, incoming.retentionTimestamp)
-	if !stored.retentionIsOlderThan(incomingRetentionTS) {
+	if !stored.retentionIsOlderThan(incomingRetentionTS) || stored.complianceWouldWeaken(incoming) {
 		// The stored retention is at least as new as the incoming one (or the
 		// incoming update is unordered): drop the incoming value and put the stored
 		// state back, which may itself be a removal (value keys absent, timestamp

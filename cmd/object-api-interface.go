@@ -71,6 +71,7 @@ type ObjectOptions struct {
 	DeleteMarker            bool // Is only set in DELETE operations for delete marker replication
 	CheckDMReplicationReady bool // Is delete marker ready to be replicated - set only during HEAD
 	Tagging                 bool // Is only in GET/HEAD operations to return tagging metadata along with regular metadata and body.
+	TaggingCount            bool // GET/HEAD caller is authorized to receive object tag metadata.
 
 	UserDefined         map[string]string   // only set in case of POST/PUT operations
 	ObjectAttributes    map[string]struct{} // Attribute tags defined by the users for the GetObjectAttributes request
@@ -122,6 +123,10 @@ type ObjectOptions struct {
 
 	// Pools-layer version resolver; the caller holds the shared object lock.
 	replicaObjectInfo GetObjectInfoFn
+	// Verifies protected content in every pool before a replica commits.
+	replicaContentGuard replicaContentGuardFn
+	// Selected under the object locks, before copy encryption/compression.
+	copyPlan *copyObjectPlan
 
 	// RefuseLockedOverwrite refuses, under the destination's write lock, a
 	// write that would replace a stored version Object Lock protects: the
@@ -297,6 +302,7 @@ type ObjectLayer interface {
 	NewObjectNSLock(bucket, object string) RWLocker
 	// lockObjects locks several objects together, see erasureServerPools.
 	lockObjects(ctx context.Context, reqs ...objectLockRequest) (LockContext, func(), error)
+	prepareCopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (copyObjectPlan, error)
 
 	// Storage operations.
 	Shutdown(context.Context) error

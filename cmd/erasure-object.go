@@ -133,8 +133,25 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 	}
 
 	if dstOpts.ReplicaLockReconcile {
-		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(fi.Metadata))
-		reconcileStoredObjectTags(srcInfo.UserDefined, fi.Metadata[xhttp.AmzObjectTagging], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
+		stored := fi.ToObjectInfo(dstBucket, dstObject, dstOpts.Versioned || dstOpts.VersionSuspended)
+		if srcInfo.versionOnly || dstOpts.replicaObjectInfo != nil {
+			// fi describes the source of the new reference, not the version
+			// being replaced. A pooled lookup also preserves protection merged
+			// from another copy, even when this set holds a newer weak revision.
+			getInfo := er.getObjectInfo
+			if dstOpts.replicaObjectInfo != nil {
+				getInfo = dstOpts.replicaObjectInfo
+			}
+			stored, err = replicaStoredObjectInfo(ctx, func(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+				opts.NoLock = true
+				return getInfo(ctx, bucket, object, opts)
+			}, dstBucket, dstObject, dstOpts.VersionID)
+			if err != nil {
+				return oi, err
+			}
+		}
+		reconcileStoredObjectLock(srcInfo.UserDefined, storedObjectLockState(stored.UserDefined))
+		reconcileStoredObjectTags(srcInfo.UserDefined, stored.UserTags, stored.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp])
 	}
 
 	filterOnlineDisksInplace(fi, metaArr, onlineDisks)
@@ -146,6 +163,17 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		if versionID == "" {
 			versionID = mustGetUUID()
 			fi.IsLatest = true // we are creating a new version so this is latest.
+		}
+	}
+	if srcInfo.versionOnly && (dstOpts.ReplicaLockReconcile || dstOpts.ReplicationRequest) && !dstOpts.DataMovement {
+		candidate := slices.Clone(metaArr)
+		for i := range candidate {
+			candidate[i].VersionID = versionID
+			candidate[i].Metadata = srcInfo.UserDefined
+		}
+		readDisks, readMeta := shuffleDisksAndPartsMetadataByIndex(onlineDisks, candidate, fi)
+		if err := er.checkReplicaContent(ctx, dstBucket, dstObject, srcBucket, srcObject, readMeta, readDisks, dstOpts); err != nil {
+			return oi, err
 		}
 	}
 
@@ -935,10 +963,13 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 	// to the disks; this value is not accurate because we do
 	// not know the storage class of the object yet
 	minDisks := 0
-	if p := globalStorageClass.GetParityForSC(""); p > -1 {
+	if p := globalStorageClass.GetParityForSC(""); p > -1 && p < er.setDriveCount {
 		minDisks = er.setDriveCount - p
 	} else {
 		minDisks = er.setDriveCount - er.defaultParityCount
+	}
+	if minDisks < 1 {
+		minDisks = 1
 	}
 
 	if minDisks == er.setDriveCount/2 {
@@ -1722,6 +1753,9 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	}
 
 	// Rename the successfully written temporary object to final location.
+	if err := er.checkReplicaContent(ctx, bucket, object, minioMetaTmpBucket, tempObj, partsMetadata, onlineDisks, opts); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
 	onlineDisks, versions, oldDataDir, err := renameData(ctx, onlineDisks, minioMetaTmpBucket, tempObj, partsMetadata, bucket, object, writeQuorum)
 	if err != nil {
 		if errors.Is(err, errFileNotFound) {
@@ -2186,7 +2220,7 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 			// A restored-copy expiry needs fresh metadata to confirm its target
 			// and deadline, a checked expiry to guard its protection; ordinary
 			// unversioned DELETE may still try a blind delete.
-			if opts.Transition.ExpireRestored || checkedExpiry || opts.Versioned || opts.VersionSuspended || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
+			if opts.Transition.ExpireRestored || checkedExpiry || opts.Versioned || opts.VersionSuspended || opts.RefuseLockedOverwrite || countOnlineDisks(storageDisks) < len(storageDisks)/2+1 {
 				// Add an MRF heal for next time.
 				er.addPartial(bucket, object, opts.VersionID)
 				return objInfo, InsufficientWriteQuorum{}
@@ -2237,8 +2271,28 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		}
 	}
 
+	// When versioning is disabled or suspended for this key, an unaddressed
+	// delete overwrites or removes the null version even if a newer non-null
+	// version is returned as latest by getObjectInfoAndQuorum above.
+	retOI, retErr := goi, gerr
+	if !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" && (opts.EvalRetentionBypassFn != nil || opts.RefuseLockedOverwrite) {
+		if gerr == nil && goi.VersionID != "" && goi.VersionID != nullVersionID {
+			nullOpts := opts
+			nullOpts.VersionID = nullVersionID
+			retOI, _, retErr = er.getObjectInfoAndQuorum(ctx, bucket, object, nullOpts)
+			if _, ok := retErr.(InsufficientReadQuorum); ok && opts.RefuseLockedOverwrite {
+				er.addPartial(bucket, object, nullVersionID)
+				return objInfo, InsufficientWriteQuorum{}
+			}
+		}
+	}
+
 	if opts.EvalRetentionBypassFn != nil {
-		if err := opts.EvalRetentionBypassFn(goi, gerr); err != nil {
+		if err := opts.EvalRetentionBypassFn(retOI, retErr); err != nil {
+			return ObjectInfo{}, err
+		}
+	} else if opts.RefuseLockedOverwrite && !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" {
+		if err := refuseLockedMarkerOverwrite(ctx, bucket, object, nullVersionID, retOI, retErr); err != nil {
 			return ObjectInfo{}, err
 		}
 	}
@@ -2560,7 +2614,7 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 
 	fi.Metadata[xhttp.AmzObjectTagging] = tags
 	fi.ReplicationState = opts.PutReplicationState()
-	stamp := monotonicTaggingTimestamp(opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
+	stamp := monotonicMetadataTimestamp(opts.UserDefined[ReservedMetadataPrefixLower+TaggingTimestamp], fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp])
 	maps.Copy(fi.Metadata, opts.UserDefined)
 	if stamp != "" {
 		fi.Metadata[ReservedMetadataPrefixLower+TaggingTimestamp] = stamp

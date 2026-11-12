@@ -271,10 +271,32 @@ func (z *erasureServerPools) applyMigrationExpiry(ctx context.Context, bucket, o
 // in the source until the ordinary expiry path has deleted them: that path
 // owns replication state and tier cleanup, and it re-evaluates the current
 // lifecycle rule. A migration cleanup must never turn an asynchronous ILM
-// decision into an unconditional physical purge.
-func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) error {
+// decision into an unconditional physical purge. It returns how many source
+// versions were removed, including versions deleted by ILM before cleanup.
+func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) (int, error) {
+	err := z.retireMovedVersions(ctx, bucket, object, source, versions, expired)
+	removed, countErr := z.countAbsentMigrationVersions(ctx, bucket, object, source, versions)
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	if err != nil {
+		return removed, err
+	}
+	return removed, countErr
+}
+
+// retireMovedVersions does not infer physical progress from a pool-level read
+// or delete result. Decommission verifies the entire walk snapshot once after
+// this cleanup and tier GC, including versions concurrently deleted by clients.
+func (z *erasureServerPools) retireMovedVersions(ctx context.Context, bucket, object string, source int, versions []FileInfo, expired []migrationExpiredVersion) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := z.applyMigrationExpiry(ctx, bucket, object, source, expired); err != nil {
 		return err
+	}
+	if len(versions) == 0 {
+		return nil
 	}
 	object = encodeDirObject(object)
 	lk := z.NewNSLock(bucket, object)
@@ -289,6 +311,7 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		if vid == "" {
 			vid = nullVersionID
 		}
+		expiredVersion := isExpiredVersion(expired, version)
 		copies, err := z.objectPoolInfos(ctx, bucket, object, ObjectOptions{VersionID: vid, NoAuditLog: true})
 		if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 			continue
@@ -311,7 +334,7 @@ func (z *erasureServerPools) removeMovedVersions(ctx context.Context, bucket, ob
 		if !src.ModTime.Equal(version.ModTime) || src.DeleteMarker != version.Deleted {
 			return PreConditionFailed{}
 		}
-		if isExpiredVersion(expired, version) {
+		if expiredVersion {
 			// The logical expiry path owns this version. Keeping the source is
 			// also the retry point if that path failed or the pool check races it.
 			continue
@@ -370,19 +393,7 @@ func (z *erasureServerPools) healObjectInPool(ctx context.Context, er *erasureOb
 // mergePoolLockState resolves each independently ordered field. An ordered
 // removal is a value in its own right; an absent unordered field is not one.
 func mergePoolLockState(copies []PoolObjInfo) objectLockState {
-	state := storedObjectLockState(copies[0].ObjInfo.UserDefined)
-	for _, copy := range copies[1:] {
-		next := storedObjectLockState(copy.ObjInfo.UserDefined)
-		retentionTime, _ := time.Parse(time.RFC3339Nano, next.retentionTimestamp)
-		if state.retentionIsOlderThan(retentionTime) || (state.retentionTimestamp == "" && state.mode == "" && next.mode != "") {
-			state.mode, state.retainUntil, state.retentionTimestamp = next.mode, next.retainUntil, next.retentionTimestamp
-		}
-		holdTime, _ := time.Parse(time.RFC3339Nano, next.legalHoldTimestamp)
-		if state.legalHoldIsOlderThan(holdTime) || (state.legalHoldTimestamp == "" && state.legalHold == "" && next.legalHold != "") {
-			state.legalHold, state.legalHoldTimestamp = next.legalHold, next.legalHoldTimestamp
-		}
-	}
-	return state
+	return reducePoolLockState(copies, storedObjectLockState)
 }
 
 func replaceObjectLockMetadata(metadata map[string]string, state objectLockState) {
@@ -534,10 +545,10 @@ func reconcileStoredObjectTags(metadata map[string]string, storedTags, storedTim
 	}
 }
 
-// Local tagging mutations must advance the revision they overwrite, even when
+// Local metadata mutations must advance the revision they overwrite, even when
 // a request's clock or lock acquisition order is behind the stored revision.
 // Replica writes use reconcileStoredObjectTags instead of minting a revision.
-func monotonicTaggingTimestamp(incoming, stored string) string {
+func monotonicMetadataTimestamp(incoming, stored string) string {
 	requested, err := time.Parse(time.RFC3339Nano, incoming)
 	if err != nil {
 		return incoming
@@ -635,6 +646,26 @@ func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket,
 		case opts.VersionID != "":
 			// An addressed version already resolved every copy above.
 			logical = mergedPoolObjectInfo(copies)
+		case !opts.Versioned && !opts.DeleteMarker:
+			// An unqualified delete when versioning is not active for this key
+			// removes or replaces the null version in every pool that holds one,
+			// even if a newer non-null version is current for reads.
+			nullOpts := opts
+			nullOpts.VersionID = nullVersionID
+			nullCopies, err := z.objectPoolInfos(ctx, bucket, object, nullOpts)
+			switch {
+			case err == nil:
+				if nullCopies[0].ObjInfo.DeleteMarker {
+					gerr = toObjectErr(errFileNotFound, bucket, object)
+					logical = nullCopies[0].ObjInfo
+				} else {
+					logical = mergedPoolObjectInfo(nullCopies)
+				}
+			case isErrObjectNotFound(err) || isErrVersionNotFound(err):
+				gerr = toObjectErr(errFileNotFound, bucket, object)
+			default:
+				return ObjectInfo{}, err
+			}
 		default:
 			versions, err := z.metadataPoolInfos(ctx, bucket, object, opts)
 			if err != nil {
@@ -650,6 +681,14 @@ func (z *erasureServerPools) deleteObjectReconciled(ctx context.Context, bucket,
 				return ObjectInfo{}, err
 			}
 			opts.EvalRetentionBypassFn = nil
+			if !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" {
+				opts.RefuseLockedOverwrite = false
+			}
+		} else if opts.RefuseLockedOverwrite && !opts.Versioned && !opts.DeleteMarker && opts.VersionID == "" {
+			if err := refuseLockedMarkerOverwrite(ctx, bucket, object, nullVersionID, logical, gerr); err != nil {
+				return ObjectInfo{}, err
+			}
+			opts.RefuseLockedOverwrite = false
 		}
 		if opts.EvalMetadataFn != nil {
 			decision, err := opts.EvalMetadataFn(&logical, gerr)

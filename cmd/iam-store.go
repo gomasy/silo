@@ -20,7 +20,6 @@ package cmd
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -2930,30 +2929,19 @@ func updatedServiceAccountCredentials(ctx context.Context, accessKey string, cr 
 	// at this point.
 	m.Delete(sessionPolicyNameExtracted)
 
-	nosp := opts.sessionPolicy == nil || opts.sessionPolicy.Version == "" && len(opts.sessionPolicy.Statements) == 0
-
-	// sessionPolicy is nil and there is embedded policy attached we remove
-	// embedded policy at that point.
-	if _, ok := m.Lookup(policy.SessionPolicyName); ok && nosp {
-		m.Delete(policy.SessionPolicyName)
-		m.Set(iamPolicyClaimNameSA(), inheritedPolicyType)
-	}
-
-	if opts.sessionPolicy != nil { // session policies is being updated
-		if err := opts.sessionPolicy.Validate(); err != nil {
+	// A nil sessionPolicy is an edit that does not concern the policy, and
+	// the embedded one stays. Only a policy that was given, and is empty,
+	// removes it: the account then has all its parent is allowed, which is
+	// usually more.
+	if opts.sessionPolicy != nil {
+		policyBuf, err := marshalServiceAccountPolicy(opts.sessionPolicy)
+		if err != nil {
 			return cr, err
 		}
-
-		if opts.sessionPolicy.Version != "" && len(opts.sessionPolicy.Statements) > 0 {
-			policyBuf, err := json.Marshal(opts.sessionPolicy)
-			if err != nil {
-				return cr, err
-			}
-
-			if len(policyBuf) > maxSVCSessionPolicySize {
-				return cr, errSessionPolicyTooLarge
-			}
-
+		if len(policyBuf) == 0 {
+			m.Delete(policy.SessionPolicyName)
+			m.Set(iamPolicyClaimNameSA(), inheritedPolicyType)
+		} else {
 			// Overwrite session policy claims.
 			m.Set(policy.SessionPolicyName, base64.StdEncoding.EncodeToString(policyBuf))
 			m.Set(iamPolicyClaimNameSA(), embeddedPolicyType)
