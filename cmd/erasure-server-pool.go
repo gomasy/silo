@@ -98,10 +98,6 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 		n = 2048
 	}
 
-	if globalIsCICD {
-		n = 256 // 256MiB for CI/CD environments is sufficient
-	}
-
 	// Avoid allocating more than half of the available memory
 	if maxN := availableMemory() / (blockSizeV2 * 2); n > maxN {
 		n = maxN
